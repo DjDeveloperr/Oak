@@ -41,11 +41,15 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Detect test script
-        id: test-script
+      - name: Run tests if present
         run: |
-          node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); console.log('has_test=' + Boolean(pkg.scripts && pkg.scripts.test))" >> \"$GITHUB_OUTPUT\"
-
-      - name: Run tests
-        if: steps.test-script.outputs.has_test == 'true'
-        run: npm test
+          if node <<'EOF'
+          const fs = require("node:fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          process.exit(pkg.scripts && pkg.scripts.test ? 0 : 1);
+          EOF
+          then
+            npm test
+          else
+            echo "No test script defined; skipping tests."
+          fi

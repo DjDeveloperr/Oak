@@ -9,10 +9,11 @@
     "build": "swc src -d dist --config-file ./.swcrc",
     "start": "node dist/src/index.js",
     "start:bot": "node dist/src/bot.js",
-    "check": "npm run lint && npm run typecheck && npm run build",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run build",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "lint": "eslint \"src/**/*.ts\"",
     "lint:fix": "eslint \"src/**/*.ts\" --fix",
-    "format": "npm run lint:fix",
     "typecheck": "tsc --noEmit",
     "dry": "npm run build && OAK_DRY_RUN=1 node dist/src/bot.js"
   },
@@ -29,6 +30,7 @@
     "@types/node": "^25.6.0",
     "eslint": "^10.2.0",
     "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.6.2",
     "typescript": "^6.0.2",
     "typescript-eslint": "^8.58.1"
   }

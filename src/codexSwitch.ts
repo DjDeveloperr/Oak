@@ -1,7 +1,13 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  readdir,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -210,13 +216,11 @@ async function resolveActiveCodexProfile(
     if (trackedProfile && matches.includes(trackedProfile)) {
       return trackedProfile;
     }
-    return matches.length === 1 ? matches[0] ?? null : null;
+    return matches.length === 1 ? (matches[0] ?? null) : null;
   };
 
   const resolvedProfile =
-    chooseMatch(exactMatches) ??
-    chooseMatch(accountMatches) ??
-    trackedProfile;
+    chooseMatch(exactMatches) ?? chooseMatch(accountMatches) ?? trackedProfile;
 
   if (resolvedProfile && resolvedProfile !== trackedProfile) {
     await writeActiveCodexProfile(resolvedProfile);
@@ -362,12 +366,12 @@ export function buildCodexSwitchMessage(options: {
     "This saves the active profile's live `auth.json`, then copies the selected profile into `~/.codex/auth.json`.",
     "Restart Codex manually when safe after switching.",
   ];
-  const highlightedProfile = options.selectedProfile ?? (
-    options.state.activeProfile &&
+  const highlightedProfile =
+    options.selectedProfile ??
+    (options.state.activeProfile &&
     options.state.profiles.includes(options.state.activeProfile)
       ? options.state.activeProfile
-      : null
-  );
+      : null);
 
   lines.push(
     options.state.activeProfile

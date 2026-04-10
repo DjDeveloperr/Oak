@@ -117,13 +117,18 @@ export const oakConfig = {
   configPath: path.join(runtimeDir, "config.json"),
   discordToken: (process.env.OAK_DISCORD_TOKEN ?? "").trim(),
   ownerUserId: (process.env.OAK_OWNER_ID ?? "").trim(),
-  codexBin: (process.env.OAK_CODEX_BIN ?? process.env.CODEX_BIN ?? "codex").trim(),
+  codexBin: (
+    process.env.OAK_CODEX_BIN ??
+    process.env.CODEX_BIN ??
+    "codex"
+  ).trim(),
   codexWsUrl: (process.env.OAK_CODEX_WS_URL ?? "ws://127.0.0.1:4789").trim(),
   approvalPolicy: "never" as const,
   threadSandbox: "danger-full-access" as const,
   turnSandboxPolicy: buildOakTurnSandboxPolicy(),
   model: (process.env.OAK_CODEX_MODEL ?? "").trim() || DEFAULT_OAK_MODEL,
-  reasoningEffort: (process.env.OAK_CODEX_REASONING_EFFORT ?? "").trim() || null,
+  reasoningEffort:
+    (process.env.OAK_CODEX_REASONING_EFFORT ?? "").trim() || null,
   reasoningSummary:
     (process.env.OAK_CODEX_REASONING_SUMMARY ?? "concise").trim() || null,
   serviceTier: (process.env.OAK_CODEX_SERVICE_TIER ?? "").trim() || null,

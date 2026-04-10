@@ -263,13 +263,15 @@ export function buildThreadPreferenceCustomId(
         ? THREAD_REASONING_MENU_PREFIX
         : kind === "service_tier"
           ? THREAD_SERVICE_TIER_MENU_PREFIX
-        : THREAD_FAST_MODE_BUTTON_PREFIX;
+          : THREAD_FAST_MODE_BUTTON_PREFIX;
   return `${prefix}:${target.threadId}:${target.userId}`;
 }
 
-export function parseThreadPreferenceCustomId(
-  customId: string,
-): ({ kind: "model" | "reasoning" | "service_tier" | "fast_mode" } & ThreadPreferenceMenuTarget) | null {
+export function parseThreadPreferenceCustomId(customId: string):
+  | ({
+      kind: "model" | "reasoning" | "service_tier" | "fast_mode";
+    } & ThreadPreferenceMenuTarget)
+  | null {
   const [prefix, threadId, userId] = customId.split(":");
   if (!threadId || !userId) {
     return null;
@@ -383,9 +385,7 @@ export function buildThreadPreferenceMessage(options: {
           .setLabel(option.label)
           .setValue(option.value)
           .setDescription(option.description)
-          .setDefault(
-            option.value === (normalizedServiceTier ?? "default"),
-          ),
+          .setDefault(option.value === (normalizedServiceTier ?? "default")),
       ),
     );
 

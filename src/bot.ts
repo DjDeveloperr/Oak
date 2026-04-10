@@ -103,12 +103,10 @@ const oakAccessConfigStore = new OakAccessConfigStore(
 );
 const sessions = new Map<string, SessionContext>();
 const OAK_RESTART_CONTINUE_TEXT = "continue";
-let oakModelOptionsCache:
-  | {
-      expiresAt: number;
-      data: OakModelOption[];
-    }
-  | null = null;
+let oakModelOptionsCache: {
+  expiresAt: number;
+  data: OakModelOption[];
+} | null = null;
 
 function log(message: string, context?: Record<string, unknown>): void {
   if (context) {
@@ -780,9 +778,7 @@ function stripLeadingBotMentionForThreadTitle(
     return normalizeWhitespace(cleanContent);
   }
 
-  return normalizeWhitespace(
-    cleanContent.replace(/^@\S+[\s:,-]*/i, ""),
-  );
+  return normalizeWhitespace(cleanContent.replace(/^@\S+[\s:,-]*/i, ""));
 }
 
 function buildTextThreadName(message: Message, botUserId: string): string {
@@ -905,7 +901,9 @@ function sessionHasTrackedActiveAgents(
   );
 }
 
-function sessionHasActiveWork(session: SessionContext | SessionRecord): boolean {
+function sessionHasActiveWork(
+  session: SessionContext | SessionRecord,
+): boolean {
   return (
     ("record" in session
       ? session.record.streamingActive
@@ -1127,7 +1125,9 @@ async function removeSessionTrackedAgents(
   await persistSession(session);
 }
 
-async function clearSessionTrackedAgents(session: SessionContext): Promise<void> {
+async function clearSessionTrackedAgents(
+  session: SessionContext,
+): Promise<void> {
   if (session.record.activeAgents.length === 0) {
     return;
   }
@@ -1765,7 +1765,10 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
       continue;
     }
 
-    if (entry.type === "event_msg" && payload.type === "collab_agent_spawn_end") {
+    if (
+      entry.type === "event_msg" &&
+      payload.type === "collab_agent_spawn_end"
+    ) {
       const agentThreadId =
         typeof payload.new_thread_id === "string"
           ? payload.new_thread_id.trim()
@@ -1813,7 +1816,8 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
           }
 
           const threadId =
-            typeof (entryValue as { thread_id?: unknown }).thread_id === "string"
+            typeof (entryValue as { thread_id?: unknown }).thread_id ===
+            "string"
               ? (entryValue as { thread_id: string }).thread_id.trim()
               : "";
           return threadId ? [threadId] : [];
@@ -2415,7 +2419,9 @@ async function recoverPendingRestartContinueSessions(
 
   for (const record of pendingRecords) {
     try {
-      const channel = await discordClient.channels.fetch(record.discordThreadId);
+      const channel = await discordClient.channels.fetch(
+        record.discordThreadId,
+      );
       if (!channel?.isThread()) {
         log("Skipping Oak restart-continue recovery for non-thread channel", {
           discordThreadId: record.discordThreadId,
@@ -2864,9 +2870,8 @@ async function handleThreadPreferenceInteraction(
     ...session.record,
     ...nextPreferences,
     serviceTier: nextServiceTier,
-    fastModeEnabled: parsed.kind === "service_tier"
-      ? session.record.fastModeEnabled
-      : false,
+    fastModeEnabled:
+      parsed.kind === "service_tier" ? session.record.fastModeEnabled : false,
     baseModel: parsed.kind === "service_tier" ? session.record.baseModel : null,
     baseReasoningEffort:
       parsed.kind === "service_tier"

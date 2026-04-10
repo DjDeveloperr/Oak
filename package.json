@@ -1,0 +1,35 @@
+{
+  "name": "oak-codex-discord-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discord bot that runs OpenAI Codex through the Codex app-server.",
+  "type": "module",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "swc src -d dist --config-file ./.swcrc",
+    "start": "node dist/src/index.js",
+    "start:bot": "node dist/src/bot.js",
+    "check": "npm run lint && npm run typecheck && npm run build",
+    "lint": "eslint \"src/**/*.ts\"",
+    "lint:fix": "eslint \"src/**/*.ts\" --fix",
+    "format": "npm run lint:fix",
+    "typecheck": "tsc --noEmit",
+    "dry": "npm run build && OAK_DRY_RUN=1 node dist/src/bot.js"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.2",
+    "dotenv": "^17.4.1"
+  },
+  "devDependencies": {
+    "@swc/cli": "^0.8.1",
+    "@swc/core": "^1.15.24",
+    "@types/node": "^25.6.0",
+    "eslint": "^10.2.0",
+    "eslint-config-prettier": "^10.1.8",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.58.1"
+  }
+}

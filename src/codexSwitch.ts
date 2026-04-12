@@ -26,6 +26,7 @@ const CODEX_ACTIVE_PROFILE_PATH = path.join(
   CODEX_PROFILES_DIR,
   ".active-profile",
 );
+const CODEX_CURRENT_PROFILE_PATH = path.join(homedir(), ".codex_current");
 const CODEX_AUTH_DIR = path.join(homedir(), ".codex");
 const CODEX_AUTH_PATH = path.join(CODEX_AUTH_DIR, "auth.json");
 
@@ -72,13 +73,12 @@ async function runGitRefreshStep(args: string[]): Promise<void> {
 }
 
 export async function refreshCodexProfiles(): Promise<void> {
-  await runGitRefreshStep(["restore", "."]);
-  await runGitRefreshStep(["pull"]);
+  await runGitRefreshStep(["pull", "--ff-only"]);
 }
 
-async function readActiveCodexProfile(): Promise<string | null> {
+async function readProfileMarker(markerPath: string): Promise<string | null> {
   try {
-    const profile = (await readFile(CODEX_ACTIVE_PROFILE_PATH, "utf8")).trim();
+    const profile = (await readFile(markerPath, "utf8")).trim();
     return profile || null;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -87,21 +87,98 @@ async function readActiveCodexProfile(): Promise<string | null> {
     }
 
     throw new Error(
-      `Failed to read ${toTildePath(CODEX_ACTIVE_PROFILE_PATH)}: ${asErrorMessage(error)}`,
+      `Failed to read ${toTildePath(markerPath)}: ${asErrorMessage(error)}`,
     );
   }
 }
 
-async function writeActiveCodexProfile(profile: string): Promise<void> {
-  await mkdir(CODEX_PROFILES_DIR, { recursive: true });
+async function readTrackedActiveCodexProfile(): Promise<string | null> {
+  const [repoProfile, currentProfile] = await Promise.all([
+    readProfileMarker(CODEX_ACTIVE_PROFILE_PATH),
+    readProfileMarker(CODEX_CURRENT_PROFILE_PATH),
+  ]);
+
+  return repoProfile ?? currentProfile;
+}
+
+async function writeProfileMarker(
+  markerPath: string,
+  profile: string,
+): Promise<void> {
+  await mkdir(path.dirname(markerPath), { recursive: true });
 
   try {
-    await writeFile(CODEX_ACTIVE_PROFILE_PATH, `${profile}\n`, "utf8");
+    await writeFile(markerPath, `${profile}\n`, "utf8");
   } catch (error) {
     throw new Error(
-      `Failed to write ${toTildePath(CODEX_ACTIVE_PROFILE_PATH)}: ${asErrorMessage(error)}`,
+      `Failed to write ${toTildePath(markerPath)}: ${asErrorMessage(error)}`,
     );
   }
+}
+
+function toRepoRelativePath(filePath: string): string {
+  const repoRelativePath = path.relative(CODEX_PROFILES_DIR, filePath);
+  if (
+    !repoRelativePath ||
+    repoRelativePath.startsWith("..") ||
+    path.isAbsolute(repoRelativePath)
+  ) {
+    throw new Error(
+      `Changed file is outside ${toTildePath(CODEX_PROFILES_DIR)}: ${toTildePath(filePath)}`,
+    );
+  }
+  return repoRelativePath;
+}
+
+async function hasGitChangesForPaths(paths: string[]): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["status", "--short", "--untracked-files=all", "--", ...paths],
+      {
+        cwd: CODEX_PROFILES_DIR,
+      },
+    );
+    return stdout.trim().length > 0;
+  } catch (error) {
+    throw new Error(
+      `git status failed in ${toTildePath(CODEX_PROFILES_DIR)}: ${asErrorMessage(error)}`,
+    );
+  }
+}
+
+async function pushCodexProfileChanges(changedPaths: string[]): Promise<void> {
+  const repoPaths = [...new Set(changedPaths.map(toRepoRelativePath))];
+  if (repoPaths.length === 0) {
+    return;
+  }
+
+  if (!(await hasGitChangesForPaths(repoPaths))) {
+    return;
+  }
+
+  try {
+    await execFileAsync("git", ["add", "--", ...repoPaths], {
+      cwd: CODEX_PROFILES_DIR,
+    });
+    await execFileAsync("git", ["commit", "-m", "update", "--", ...repoPaths], {
+      cwd: CODEX_PROFILES_DIR,
+    });
+    await execFileAsync("git", ["push"], {
+      cwd: CODEX_PROFILES_DIR,
+    });
+  } catch (error) {
+    throw new Error(
+      `Failed to push Codex profile updates from ${toTildePath(CODEX_PROFILES_DIR)}: ${asErrorMessage(error)}`,
+    );
+  }
+}
+
+async function persistTrackedActiveCodexProfile(profile: string): Promise<void> {
+  await refreshCodexProfiles();
+  await writeProfileMarker(CODEX_ACTIVE_PROFILE_PATH, profile);
+  await pushCodexProfileChanges([CODEX_ACTIVE_PROFILE_PATH]);
+  await writeProfileMarker(CODEX_CURRENT_PROFILE_PATH, profile);
 }
 
 function extractCodexAccountId(rawAuth: string): string | null {
@@ -175,7 +252,7 @@ async function resolveActiveCodexProfile(
   profiles?: string[],
 ): Promise<string | null> {
   const [trackedProfile, availableProfiles, liveAuth] = await Promise.all([
-    readActiveCodexProfile(),
+    readTrackedActiveCodexProfile(),
     profiles ? Promise.resolve(profiles) : listAllCodexProfiles(),
     readCodexAuthIdentity(CODEX_AUTH_PATH),
   ]);
@@ -223,7 +300,7 @@ async function resolveActiveCodexProfile(
     chooseMatch(exactMatches) ?? chooseMatch(accountMatches) ?? trackedProfile;
 
   if (resolvedProfile && resolvedProfile !== trackedProfile) {
-    await writeActiveCodexProfile(resolvedProfile);
+    await persistTrackedActiveCodexProfile(resolvedProfile);
   }
 
   return resolvedProfile;
@@ -275,7 +352,9 @@ export async function switchCodexProfile(account: string): Promise<{
 }> {
   const sourcePath = path.join(CODEX_PROFILES_DIR, account, "auth.json");
   const previousProfile = await resolveActiveCodexProfile();
+  const changedPaths = new Set<string>();
 
+  await refreshCodexProfiles();
   await mkdir(CODEX_AUTH_DIR, { recursive: true });
 
   let previousProfilePath: string | null = null;
@@ -293,6 +372,7 @@ export async function switchCodexProfile(account: string): Promise<{
       await copyFile(CODEX_AUTH_PATH, previousPath);
       previousProfileHadLiveAuth = true;
       previousProfilePath = toTildePath(previousPath);
+      changedPaths.add(previousPath);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
@@ -321,7 +401,10 @@ export async function switchCodexProfile(account: string): Promise<{
   }
 
   try {
-    await writeActiveCodexProfile(account);
+    await writeProfileMarker(CODEX_ACTIVE_PROFILE_PATH, account);
+    changedPaths.add(CODEX_ACTIVE_PROFILE_PATH);
+    await pushCodexProfileChanges([...changedPaths]);
+    await writeProfileMarker(CODEX_CURRENT_PROFILE_PATH, account);
   } catch (error) {
     throw new Error(
       `Switched auth into ${toTildePath(CODEX_AUTH_PATH)}, but failed to update the tracked active profile: ${asErrorMessage(error)}`,

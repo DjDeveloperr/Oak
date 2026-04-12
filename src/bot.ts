@@ -52,6 +52,7 @@ import {
 } from "./accessConfig.js";
 import {
   OAK_CONFIG_COMMAND_NAME,
+  OAK_RESUME_COMMAND_NAME,
   getOakApplicationCommandData,
 } from "./applicationCommands.js";
 import {
@@ -1642,6 +1643,12 @@ async function handleSessionEvent(
       }
 
       resetCommentaryState(session);
+      session.record = {
+        ...session.record,
+        lastAssistantResponse: event.text,
+        updatedAt: new Date().toISOString(),
+      };
+      await persistSession(session);
       await sendFinalAnswer(session, event.text);
       return;
     case "turn_aborted":
@@ -2039,6 +2046,37 @@ async function ensureSessionReady(session: SessionContext): Promise<void> {
   session.ready = true;
 }
 
+function buildSessionContext(
+  thread: ThreadChannel,
+  record: SessionRecord,
+): SessionContext {
+  const session: SessionContext = {
+    record,
+    thread,
+    client: createCodexClient(),
+    ready: false,
+    needsClientRefresh: false,
+    streamedOutputKeys: new Set<string>(),
+    lastCommentaryTurnId: null,
+    lastCommentaryText: "",
+    typingTimer: null,
+    rolloutPoller: null,
+    reconnectTimer: null,
+    reconnectInFlight: null,
+    reconnectAttempt: 0,
+    restartResumeTimer: null,
+    restartResumeInFlight: null,
+    restartResumeAttempt: 0,
+    rolloutReadOffset: record.rolloutReadOffset,
+    rolloutLineRemainder: "",
+    lastReportedErrorText: null,
+    lastReportedErrorAt: 0,
+  };
+
+  attachSessionEventBridge(session);
+  return session;
+}
+
 async function getOrCreateSession(
   thread: ThreadChannel,
 ): Promise<SessionContext | null> {
@@ -2227,7 +2265,7 @@ async function createFreshSession(
   }
 
   const session: SessionContext = {
-    record: {
+    ...buildSessionContext(thread, {
       discordThreadId: thread.id,
       discordThreadName: thread.name,
       guildId: thread.guildId,
@@ -2246,33 +2284,64 @@ async function createFreshSession(
       pendingRestartContinue: false,
       pendingRestartContinueAt: null,
       rolloutReadOffset: 0,
+      lastAssistantResponse: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    },
-    thread,
-    client: createCodexClient(),
-    ready: false,
-    needsClientRefresh: false,
-    streamedOutputKeys: new Set<string>(),
-    lastCommentaryTurnId: null,
-    lastCommentaryText: "",
-    typingTimer: null,
-    rolloutPoller: null,
-    reconnectTimer: null,
-    reconnectInFlight: null,
-    reconnectAttempt: 0,
-    restartResumeTimer: null,
-    restartResumeInFlight: null,
-    restartResumeAttempt: 0,
-    rolloutReadOffset: 0,
-    rolloutLineRemainder: "",
-    lastReportedErrorText: null,
-    lastReportedErrorAt: 0,
+    }),
   };
-
-  attachSessionEventBridge(session);
   sessions.set(thread.id, session);
   return session;
+}
+
+async function createResumedSession(
+  thread: ThreadChannel,
+  sourceRecord: SessionRecord,
+): Promise<SessionContext> {
+  const existing = sessions.get(thread.id);
+  if (existing) {
+    return existing;
+  }
+
+  const now = new Date().toISOString();
+  const session = buildSessionContext(thread, {
+    ...sourceRecord,
+    discordThreadId: thread.id,
+    discordThreadName: thread.name,
+    guildId: thread.guildId,
+    discordParentChannelId: thread.parentId,
+    updatedAt: now,
+    createdAt: now,
+  });
+
+  sessions.set(thread.id, session);
+  await persistSession(session);
+  return session;
+}
+
+async function applyResumedRecordToSession(
+  session: SessionContext,
+  sourceRecord: SessionRecord,
+  lastInteractorUserId: string,
+): Promise<void> {
+  const now = new Date().toISOString();
+  session.record = {
+    ...sourceRecord,
+    discordThreadId: session.thread.id,
+    discordThreadName: session.thread.name,
+    guildId: session.thread.guildId,
+    discordParentChannelId: session.thread.parentId,
+    lastInteractorUserId,
+    updatedAt: now,
+  };
+  session.ready = false;
+  session.needsClientRefresh = false;
+  session.streamedOutputKeys.clear();
+  resetCommentaryState(session);
+  session.rolloutReadOffset = session.record.rolloutReadOffset;
+  session.rolloutLineRemainder = "";
+  await session.client.close(true);
+  attachSessionEventBridge(session);
+  await persistSession(session);
 }
 
 async function startSessionTurn(
@@ -2368,6 +2437,95 @@ async function startThreadForTextMessage(
   });
 
   return thread;
+}
+
+function buildResumeThreadName(sourceRecord: SessionRecord): string {
+  const normalized = normalizeWhitespace(sourceRecord.discordThreadName);
+  if (normalized) {
+    return normalized.slice(0, 90);
+  }
+  return `resume-${sourceRecord.codexThreadId.slice(0, 24)}`;
+}
+
+async function startThreadForResumeCommand(
+  interaction: ChatInputCommandInteraction,
+  sourceRecord: SessionRecord,
+): Promise<ThreadChannel> {
+  if (interaction.channel?.type !== ChannelType.GuildText) {
+    throw new Error("`/codex-resume` can only start a new thread from a text channel.");
+  }
+
+  return interaction.channel.threads.create({
+    name: buildResumeThreadName(sourceRecord),
+    autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+    reason: `Oak resume for ${sourceRecord.codexThreadId}`,
+  });
+}
+
+async function getLastResponseFromDiscordThread(
+  thread: ThreadChannel,
+): Promise<string | null> {
+  const messages = await thread.messages.fetch({ limit: 100 });
+  const ordered = [...messages.values()].sort(
+    (left, right) => left.createdTimestamp - right.createdTimestamp,
+  );
+
+  const responseParts: string[] = [];
+  let foundBotMessage = false;
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const message = ordered[index];
+    const content = message.content.trim();
+    if (!content) {
+      continue;
+    }
+
+    if (message.author.bot) {
+      responseParts.unshift(content);
+      foundBotMessage = true;
+      continue;
+    }
+
+    if (foundBotMessage) {
+      break;
+    }
+  }
+
+  const combined = responseParts.join("\n").trim();
+  return combined || null;
+}
+
+async function resolveLastResponseForRecord(
+  discordClient: Client,
+  record: SessionRecord,
+): Promise<string | null> {
+  if (record.lastAssistantResponse?.trim()) {
+    return record.lastAssistantResponse;
+  }
+
+  try {
+    const channel = await discordClient.channels.fetch(record.discordThreadId);
+    if (!channel?.isThread()) {
+      return null;
+    }
+    return await getLastResponseFromDiscordThread(channel);
+  } catch {
+    return null;
+  }
+}
+
+async function sendRestoredResponse(
+  thread: ThreadChannel,
+  text: string,
+): Promise<void> {
+  const normalizedText = rewriteDiscordFileReferences(text);
+  const chunks = splitDiscordText(normalizedText, DISCORD_MESSAGE_LIMIT);
+  if (chunks.length === 0) {
+    return;
+  }
+
+  for (const chunk of chunks) {
+    await thread.send(chunk);
+  }
 }
 
 async function restartCodex(): Promise<void> {
@@ -3083,6 +3241,102 @@ function toAutocompleteChoices(
     }));
 }
 
+function getSessionRecordUpdatedAtMs(record: SessionRecord): number {
+  const timestamp = Date.parse(record.updatedAt);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function resolveWorkspaceForSessionRecord(
+  record: SessionRecord,
+): OakResolvedWorkspaceRoute | null {
+  return resolveOakWorkspaceForLocation({
+    guildId: record.guildId,
+    channelId: record.discordThreadId,
+    parentChannelId: record.discordParentChannelId,
+  });
+}
+
+function listResumableSessionRecords(
+  workspaceKey: string,
+  query: string,
+): SessionRecord[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const latestByCodexThreadId = new Map<string, SessionRecord>();
+
+  for (const record of sessionStore.list()) {
+    if (!record.codexThreadId.trim()) {
+      continue;
+    }
+
+    const scope = resolveWorkspaceForSessionRecord(record);
+    if (!scope || scope.workspace.key !== workspaceKey) {
+      continue;
+    }
+
+    if (normalizedQuery) {
+      const haystacks = [
+        record.discordThreadName,
+        record.codexThreadId,
+        record.discordThreadId,
+      ].map((value) => value.trim().toLowerCase());
+      if (!haystacks.some((value) => value.includes(normalizedQuery))) {
+        continue;
+      }
+    }
+
+    const existing = latestByCodexThreadId.get(record.codexThreadId);
+    if (
+      !existing ||
+      getSessionRecordUpdatedAtMs(record) > getSessionRecordUpdatedAtMs(existing)
+    ) {
+      latestByCodexThreadId.set(record.codexThreadId, record);
+    }
+  }
+
+  return [...latestByCodexThreadId.values()].sort(
+    (left, right) =>
+      getSessionRecordUpdatedAtMs(right) - getSessionRecordUpdatedAtMs(left),
+  );
+}
+
+function buildResumeChoiceName(record: SessionRecord): string {
+  const threadName = normalizeWhitespace(record.discordThreadName) || "Untitled";
+  const date =
+    record.updatedAt.length >= 10
+      ? record.updatedAt.slice(0, 10)
+      : "unknown-date";
+  const label = `${threadName.slice(0, 45)} | ${record.codexThreadId.slice(0, 24)} | ${date}`;
+  return label.length <= 100 ? label : label.slice(0, 100);
+}
+
+function buildResumeThreadChoices(
+  workspaceKey: string,
+  query: string,
+): ApplicationCommandOptionChoiceData<string>[] {
+  return listResumableSessionRecords(workspaceKey, query)
+    .slice(0, 10)
+    .map((record) => ({
+      name: buildResumeChoiceName(record),
+      value: record.codexThreadId,
+    }));
+}
+
+function findResumableSessionRecord(
+  workspaceKey: string,
+  codexThreadId: string,
+): SessionRecord | null {
+  const normalizedThreadId = codexThreadId.trim();
+  if (!normalizedThreadId) {
+    return null;
+  }
+
+  return (
+    listResumableSessionRecords(workspaceKey, normalizedThreadId).find(
+      (record) => record.codexThreadId === normalizedThreadId,
+    ) ?? null
+  );
+}
+
 function buildWorkspaceKeyChoices(
   focusedValue: string,
 ): ApplicationCommandOptionChoiceData<string>[] {
@@ -3251,6 +3505,171 @@ async function handleOakConfigAutocomplete(
   }
 
   await interaction.respond([]);
+  return true;
+}
+
+async function handleCodexResumeAutocomplete(
+  interaction: AutocompleteInteraction,
+): Promise<boolean> {
+  if (interaction.commandName !== OAK_RESUME_COMMAND_NAME) {
+    return false;
+  }
+
+  const scope = resolveOakWorkspaceForLocation({
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    parentChannelId: getChannelParentId(interaction.channel),
+  });
+  if (
+    !scope ||
+    !oakAccessConfigStore.isUserAllowedForWorkspace(
+      scope.workspace.key,
+      interaction.user.id,
+      oakConfig.ownerUserId,
+    )
+  ) {
+    await interaction.respond([]);
+    return true;
+  }
+
+  const focused = interaction.options.getFocused(true);
+  if (focused.name !== "thread_id") {
+    await interaction.respond([]);
+    return true;
+  }
+
+  await interaction.respond(
+    buildResumeThreadChoices(scope.workspace.key, String(focused.value ?? "")),
+  );
+  return true;
+}
+
+async function handleCodexResumeCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<boolean> {
+  if (interaction.commandName !== OAK_RESUME_COMMAND_NAME) {
+    return false;
+  }
+
+  const scope = resolveOakWorkspaceForLocation({
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    parentChannelId: getChannelParentId(interaction.channel),
+  });
+  if (!scope) {
+    await replyWithSafeText(
+      interaction,
+      "Oak is not configured for this channel.",
+    );
+    return true;
+  }
+
+  if (
+    !oakAccessConfigStore.isUserAllowedForWorkspace(
+      scope.workspace.key,
+      interaction.user.id,
+      oakConfig.ownerUserId,
+    )
+  ) {
+    await replyWithSafeText(
+      interaction,
+      "You are not allowed to use Oak controls.",
+    );
+    return true;
+  }
+
+  if (
+    interaction.channel?.type !== ChannelType.GuildText &&
+    !interaction.channel?.isThread()
+  ) {
+    await replyWithSafeText(
+      interaction,
+      "`/codex-resume` only works in a text channel or thread.",
+    );
+    return true;
+  }
+
+  const codexThreadId = interaction.options.getString("thread_id", true).trim();
+  const sourceRecord = findResumableSessionRecord(
+    scope.workspace.key,
+    codexThreadId,
+  );
+  if (!sourceRecord) {
+    await replyWithSafeText(
+      interaction,
+      "That Codex thread was not found in this workspace.",
+    );
+    return true;
+  }
+
+  const targetThread = interaction.channel?.isThread()
+    ? interaction.channel
+    : await startThreadForResumeCommand(interaction, sourceRecord);
+  const existingSession = await getOrCreateSession(targetThread);
+  const existingRecord = sessionStore.get(targetThread.id);
+  let session: SessionContext;
+
+  if (
+    existingSession &&
+    existingSession.record.codexThreadId &&
+    existingSession.record.codexThreadId !== sourceRecord.codexThreadId
+  ) {
+    await replyWithSafeText(
+      interaction,
+      `This Discord thread is already linked to Codex thread \`${existingSession.record.codexThreadId}\`.`,
+    );
+    return true;
+  }
+
+  if (
+    !existingSession &&
+    existingRecord?.codexThreadId &&
+    existingRecord.codexThreadId !== sourceRecord.codexThreadId
+  ) {
+    await replyWithSafeText(
+      interaction,
+      "This Discord thread is already linked to another Codex thread.",
+    );
+    return true;
+  }
+
+  if (existingSession) {
+    if (!existingSession.record.codexThreadId) {
+      await applyResumedRecordToSession(
+        existingSession,
+        sourceRecord,
+        interaction.user.id,
+      );
+    }
+    session = existingSession;
+  } else {
+    session = await createResumedSession(targetThread, {
+      ...sourceRecord,
+      lastInteractorUserId: interaction.user.id,
+    });
+  }
+
+  await ensureSessionReady(session);
+  const lastResponse = await resolveLastResponseForRecord(
+    interaction.client,
+    sourceRecord,
+  );
+
+  await replyWithSafeText(
+    interaction,
+    interaction.channel?.isThread()
+      ? `Resumed Codex thread \`${sourceRecord.codexThreadId}\` in <#${targetThread.id}>.`
+      : `Started <#${targetThread.id}> and resumed Codex thread \`${sourceRecord.codexThreadId}\`.`,
+  );
+
+  if (lastResponse) {
+    await sendRestoredResponse(targetThread, lastResponse);
+  } else {
+    await targetThread.send(
+      "No previous Oak response was available to replay for this thread.",
+    );
+  }
+
   return true;
 }
 
@@ -3578,7 +3997,13 @@ export async function main(): Promise<void> {
 
   client.on(Events.InteractionCreate, (interaction) => {
     if (interaction.isAutocomplete()) {
-      void handleOakConfigAutocomplete(interaction).catch((error) => {
+      void (async () => {
+        if (await handleOakConfigAutocomplete(interaction)) {
+          return;
+        }
+
+        await handleCodexResumeAutocomplete(interaction);
+      })().catch((error) => {
         console.error("[oak] Autocomplete handler failed:", error);
         void interaction.respond([]).catch(() => {});
       });
@@ -3586,7 +4011,13 @@ export async function main(): Promise<void> {
     }
 
     if (interaction.isChatInputCommand()) {
-      void handleOakConfigCommand(interaction).catch((error) => {
+      void (async () => {
+        if (await handleOakConfigCommand(interaction)) {
+          return;
+        }
+
+        await handleCodexResumeCommand(interaction);
+      })().catch((error) => {
         console.error("[oak] Command handler failed:", error);
         if (!interaction.replied && !interaction.deferred) {
           void replyWithSafeText(

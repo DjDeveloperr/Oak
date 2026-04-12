@@ -33,6 +33,7 @@ export interface SessionRecord extends OakThreadPreferences {
   pendingRestartContinue: boolean;
   pendingRestartContinueAt: string | null;
   rolloutReadOffset: number;
+  lastAssistantResponse: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -126,6 +127,11 @@ export class SessionStore {
             record.rolloutReadOffset >= 0
               ? record.rolloutReadOffset
               : 0,
+          lastAssistantResponse:
+            typeof record.lastAssistantResponse === "string" &&
+            record.lastAssistantResponse.trim()
+              ? record.lastAssistantResponse
+              : null,
           createdAt: record.createdAt,
           updatedAt: record.updatedAt,
         });

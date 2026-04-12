@@ -1,6 +1,7 @@
 import { SlashCommandBuilder } from "discord.js";
 
 export const OAK_CONFIG_COMMAND_NAME = "oak-config";
+export const OAK_RESUME_COMMAND_NAME = "codex-resume";
 
 export function getOakApplicationCommandData(): ReturnType<
   SlashCommandBuilder["toJSON"]
@@ -144,6 +145,18 @@ export function getOakApplicationCommandData(): ReturnType<
                   .setRequired(true),
               ),
           ),
+      )
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName(OAK_RESUME_COMMAND_NAME)
+      .setDescription("Resume a recent Codex thread in this workspace")
+      .setDMPermission(false)
+      .addStringOption((option) =>
+        option
+          .setName("thread_id")
+          .setDescription("Codex thread to resume")
+          .setAutocomplete(true)
+          .setRequired(true),
       )
       .toJSON(),
   ];

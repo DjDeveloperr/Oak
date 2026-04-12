@@ -380,6 +380,15 @@ function extractThreadStatus(value: unknown): string | null {
   return null;
 }
 
+function isEmptyRolloutThreadReadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("codex_request_error: thread/read:") &&
+    message.includes("failed to load rollout") &&
+    message.includes("is empty")
+  );
+}
+
 function isActiveTurnMismatchError(message: string): boolean {
   return (
     message.includes("expected active turn id") ||
@@ -540,13 +549,31 @@ export class OakCodexClient {
       throw new Error("codex_thread_not_started");
     }
 
-    const result = await this.request(
-      "thread/read",
-      {
-        threadId: this.threadId,
-      },
-      15000,
-    );
+    let lastError: unknown;
+    let result: unknown;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        result = await this.request(
+          "thread/read",
+          {
+            threadId: this.threadId,
+          },
+          15000,
+        );
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (!isEmptyRolloutThreadReadError(error) || attempt === 4) {
+          throw error;
+        }
+        await delay(200 * (attempt + 1));
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
 
     const thread =
       isRecord(result) && isRecord(result.thread) ? result.thread : null;

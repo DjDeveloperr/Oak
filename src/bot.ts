@@ -9,6 +9,8 @@ import {
   SeparatorBuilder,
   TextDisplayBuilder,
   ThreadAutoArchiveDuration,
+  type ApplicationCommandOptionChoiceData,
+  type AutocompleteInteraction,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Guild,
@@ -18,7 +20,7 @@ import {
   type TextChannel,
   type ThreadChannel,
 } from "discord.js";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   OakCodexClient,
@@ -765,10 +767,11 @@ function shouldStartInThread(message: Message, botUserId: string): boolean {
   return message.mentions.users.has(botUserId);
 }
 
-function stripLeadingBotMentionForThreadTitle(
+function stripLeadingBotMention(
   rawContent: string,
   cleanContent: string,
   botUserId: string,
+  botMentionNames: readonly string[],
 ): string {
   const trimmedRaw = rawContent.trimStart();
   if (
@@ -778,14 +781,44 @@ function stripLeadingBotMentionForThreadTitle(
     return normalizeWhitespace(cleanContent);
   }
 
-  return normalizeWhitespace(cleanContent.replace(/^@\S+[\s:,-]*/i, ""));
+  const trimmedClean = cleanContent.trimStart();
+  const normalizedCandidates = [
+    ...new Set(
+      botMentionNames
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((value) => `@${value}`),
+    ),
+  ].sort((left, right) => right.length - left.length);
+
+  for (const candidate of normalizedCandidates) {
+    if (!trimmedClean.startsWith(candidate)) {
+      continue;
+    }
+
+    return normalizeWhitespace(
+      trimmedClean.slice(candidate.length).replace(/^[\s:,-]*/i, ""),
+    );
+  }
+
+  return normalizeWhitespace(trimmedClean.replace(/^@\s*/i, ""));
+}
+
+function getBotMentionNames(message: Message): string[] {
+  return [
+    message.guild?.members.me?.displayName ?? "",
+    message.client.user?.displayName ?? "",
+    message.client.user?.globalName ?? "",
+    message.client.user?.username ?? "",
+  ].filter(Boolean);
 }
 
 function buildTextThreadName(message: Message, botUserId: string): string {
-  const excerpt = stripLeadingBotMentionForThreadTitle(
+  const excerpt = stripLeadingBotMention(
     message.content,
     message.cleanContent,
     botUserId,
+    getBotMentionNames(message),
   );
   if (excerpt) {
     return excerpt.slice(0, 90);
@@ -1278,7 +1311,17 @@ async function buildUserInputs(message: Message): Promise<OakUserInput[]> {
     sections.push("User message:");
   }
 
-  sections.push(message.cleanContent.trim() || "(no text)");
+  const botUserId = message.client.user?.id ?? null;
+  const normalizedMessageText = botUserId
+    ? stripLeadingBotMention(
+        message.content,
+        message.cleanContent,
+        botUserId,
+        getBotMentionNames(message),
+      )
+    : normalizeWhitespace(message.cleanContent);
+
+  sections.push(normalizedMessageText.trim() || "(no text)");
 
   if (savedFileAttachmentLines.length > 0) {
     sections.push("");
@@ -3028,6 +3071,120 @@ function formatRouteLabel(channelId: string | null): string {
   return channelId ? `<#${channelId}>` : "`guild default`";
 }
 
+function toAutocompleteChoices(
+  values: readonly string[],
+): ApplicationCommandOptionChoiceData<string>[] {
+  return values
+    .filter((value) => value.length > 0 && value.length <= 100)
+    .slice(0, 25)
+    .map((value) => ({
+      name: value,
+      value,
+    }));
+}
+
+function buildWorkspaceKeyChoices(
+  focusedValue: string,
+): ApplicationCommandOptionChoiceData<string>[] {
+  const normalizedQuery = focusedValue.trim().toLowerCase();
+  const matchingKeys = oakAccessConfigStore
+    .listWorkspaces()
+    .map((workspace) => workspace.key)
+    .filter((key) =>
+      normalizedQuery.length === 0
+        ? true
+        : key.toLowerCase().includes(normalizedQuery),
+    )
+    .sort((left, right) => left.localeCompare(right));
+
+  const suggestions = new Set<string>(matchingKeys);
+  const normalizedFocusedValue = focusedValue.trim().toLowerCase();
+  if (
+    focusedValue.trim().length > 0 &&
+    normalizedFocusedValue.length <= 100 &&
+    !suggestions.has(normalizedFocusedValue)
+  ) {
+    suggestions.add(normalizedFocusedValue);
+  }
+
+  return toAutocompleteChoices([...suggestions]);
+}
+
+function normalizePathAutocompleteDisplay(
+  basePath: string,
+  entryName: string,
+): string {
+  if (basePath === "") {
+    return entryName;
+  }
+  if (basePath === path.sep) {
+    return path.posix.join(path.sep, entryName);
+  }
+  return `${basePath.replace(/[\\/]+$/u, "")}/${entryName}`;
+}
+
+async function buildWorkspaceRootChoices(
+  focusedValue: string,
+): Promise<ApplicationCommandOptionChoiceData<string>[]> {
+  const rawValue = focusedValue.trim();
+  const endsWithSeparator = /[\\/]$/u.test(rawValue);
+  const normalizedInput = rawValue.replaceAll("\\", "/");
+  const searchBase =
+    normalizedInput.length === 0
+      ? "."
+      : endsWithSeparator
+        ? normalizedInput
+        : path.posix.dirname(normalizedInput);
+  const fragment =
+    normalizedInput.length === 0 || endsWithSeparator
+      ? ""
+      : path.posix.basename(normalizedInput);
+  const resolvedBase = path.resolve(searchBase);
+  const displayBase =
+    normalizedInput.length === 0
+      ? ""
+      : endsWithSeparator
+        ? normalizedInput.replace(/\/+$/u, "")
+        : normalizedInput
+            .slice(0, normalizedInput.length - fragment.length)
+            .replace(/\/+$/u, "");
+  const fragmentLower = fragment.toLowerCase();
+
+  try {
+    const entries = await readdir(resolvedBase, { withFileTypes: true });
+    const suggestions = await Promise.all(
+      entries
+        .filter((entry) =>
+          fragmentLower.length === 0
+            ? true
+            : entry.name.toLowerCase().startsWith(fragmentLower),
+        )
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .slice(0, 50)
+        .map(async (entry) => {
+          const absolutePath = path.join(resolvedBase, entry.name);
+          const stats = entry.isSymbolicLink() ? await stat(absolutePath) : null;
+          const isDirectory = entry.isDirectory() || stats?.isDirectory() === true;
+          if (!isDirectory) {
+            return null;
+          }
+
+          const suggestion = normalizePathAutocompleteDisplay(
+            displayBase,
+            entry.name,
+          );
+          return suggestion.length <= 99 ? `${suggestion}/` : null;
+        }),
+    );
+
+    return toAutocompleteChoices(
+      suggestions.filter((value): value is string => value !== null),
+    );
+  } catch {
+    return [];
+  }
+}
+
 function isGuildBasedNonThreadChannel(
   interaction: ChatInputCommandInteraction,
   channelId: string | null,
@@ -3052,6 +3209,49 @@ async function syncOakApplicationCommands(client: Client): Promise<void> {
   for (const guild of client.guilds.cache.values()) {
     await registerOakCommandsForGuild(guild);
   }
+}
+
+async function handleOakConfigAutocomplete(
+  interaction: AutocompleteInteraction,
+): Promise<boolean> {
+  if (interaction.commandName !== OAK_CONFIG_COMMAND_NAME) {
+    return false;
+  }
+
+  if (!isOakAdminUserId(interaction.user.id)) {
+    await interaction.respond([]);
+    return true;
+  }
+
+  const group = interaction.options.getSubcommandGroup(false);
+  const subcommand = interaction.options.getSubcommand(false);
+  const focused = interaction.options.getFocused(true);
+
+  if (!group || !subcommand) {
+    await interaction.respond([]);
+    return true;
+  }
+
+  if (
+    focused.name === "root" &&
+    group === "workspace" &&
+    subcommand === "set"
+  ) {
+    await interaction.respond(
+      await buildWorkspaceRootChoices(String(focused.value ?? "")),
+    );
+    return true;
+  }
+
+  if (focused.name === "workspace" || focused.name === "key") {
+    await interaction.respond(
+      buildWorkspaceKeyChoices(String(focused.value ?? "")),
+    );
+    return true;
+  }
+
+  await interaction.respond([]);
+  return true;
 }
 
 async function handleOakConfigCommand(
@@ -3377,6 +3577,14 @@ export async function main(): Promise<void> {
   });
 
   client.on(Events.InteractionCreate, (interaction) => {
+    if (interaction.isAutocomplete()) {
+      void handleOakConfigAutocomplete(interaction).catch((error) => {
+        console.error("[oak] Autocomplete handler failed:", error);
+        void interaction.respond([]).catch(() => {});
+      });
+      return;
+    }
+
     if (interaction.isChatInputCommand()) {
       void handleOakConfigCommand(interaction).catch((error) => {
         console.error("[oak] Command handler failed:", error);

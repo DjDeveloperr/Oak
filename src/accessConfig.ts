@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export interface OakWorkspaceConfig {
@@ -32,10 +32,32 @@ export interface OakAccessConfigSnapshot {
   }>;
 }
 
+interface OakWorkspaceConfigInput {
+  key: string;
+  root: string;
+  allowedUserIds: string[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+interface OakWorkspaceRouteInput {
+  guildId: string;
+  channelId: string | null;
+  workspaceKey: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 interface OakAccessConfigFile {
   version: 1;
   workspaces: OakWorkspaceConfig[];
   routes: OakWorkspaceRoute[];
+}
+
+interface OakAccessConfigInput {
+  version: 1;
+  workspaces: OakWorkspaceConfigInput[];
+  routes: OakWorkspaceRouteInput[];
 }
 
 export interface OakResolvedWorkspaceRoute {
@@ -88,9 +110,7 @@ function assertWorkspaceRoot(root: string): string {
   return resolved;
 }
 
-function normalizeSnapshot(
-  snapshot: OakAccessConfigSnapshot,
-): OakAccessConfigFile {
+function normalizeSnapshot(snapshot: OakAccessConfigInput): OakAccessConfigFile {
   const now = new Date().toISOString();
   const workspaceKeys = new Set<string>();
   const workspaces = snapshot.workspaces
@@ -107,8 +127,8 @@ function normalizeSnapshot(
         key,
         root: assertWorkspaceRoot(workspace.root),
         allowedUserIds: normalizeUserIds(workspace.allowedUserIds),
-        createdAt: now,
-        updatedAt: now,
+        createdAt: workspace.createdAt ?? now,
+        updatedAt: workspace.updatedAt ?? workspace.createdAt ?? now,
       };
     })
     .sort((left, right) => left.key.localeCompare(right.key));
@@ -135,8 +155,8 @@ function normalizeSnapshot(
         guildId,
         channelId,
         workspaceKey,
-        createdAt: now,
-        updatedAt: now,
+        createdAt: route.createdAt ?? now,
+        updatedAt: route.updatedAt ?? route.createdAt ?? now,
       };
     })
     .sort((left, right) =>
@@ -155,32 +175,27 @@ function normalizeSnapshot(
 export class OakAccessConfigStore {
   private readonly workspaces = new Map<string, OakWorkspaceConfig>();
   private readonly routes = new Map<string, OakWorkspaceRoute>();
+  private readonly backupFilePath: string;
   private writeQueue = Promise.resolve();
 
   constructor(
     private readonly filePath: string,
     private readonly bootstrap: OakAccessConfigSnapshot,
-  ) {}
+  ) {
+    this.backupFilePath = `${this.filePath}.bak`;
+  }
 
   async load(): Promise<void> {
     await mkdir(path.dirname(this.filePath), { recursive: true });
 
-    try {
-      const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<OakAccessConfigFile>;
-      this.hydrate({
-        version: 1,
-        workspaces: parsed.workspaces ?? [],
-        routes: parsed.routes ?? [],
-      });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
-      }
-
-      this.hydrate(normalizeSnapshot(this.bootstrap));
-      await this.flush();
+    const persisted = await this.readPersistedConfig();
+    if (persisted) {
+      this.hydrate(persisted);
+      return;
     }
+
+    this.hydrate(normalizeSnapshot(this.bootstrap));
+    await this.flush();
   }
 
   listWorkspaces(): OakWorkspaceConfig[] {
@@ -423,11 +438,15 @@ export class OakAccessConfigStore {
         key: workspace.key,
         root: workspace.root,
         allowedUserIds: workspace.allowedUserIds ?? [],
+        createdAt: workspace.createdAt,
+        updatedAt: workspace.updatedAt,
       })),
       routes: file.routes.map((route) => ({
         guildId: route.guildId,
         channelId: route.channelId ?? null,
         workspaceKey: route.workspaceKey,
+        createdAt: route.createdAt,
+        updatedAt: route.updatedAt,
       })),
     });
 
@@ -440,6 +459,44 @@ export class OakAccessConfigStore {
     }
   }
 
+  private async readPersistedConfig(): Promise<OakAccessConfigFile | null> {
+    const primary = await this.readConfigFile(this.filePath);
+    if (primary) {
+      return primary;
+    }
+
+    return await this.readConfigFile(this.backupFilePath);
+  }
+
+  private async readConfigFile(filePath: string): Promise<OakAccessConfigFile | null> {
+    try {
+      const raw = await readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw) as Partial<OakAccessConfigFile>;
+      return normalizeSnapshot({
+        version: 1,
+        workspaces: (parsed.workspaces ?? []).map((workspace) => ({
+          key: workspace.key ?? "",
+          root: workspace.root ?? "",
+          allowedUserIds: workspace.allowedUserIds ?? [],
+          createdAt: workspace.createdAt,
+          updatedAt: workspace.updatedAt,
+        })),
+        routes: (parsed.routes ?? []).map((route) => ({
+          guildId: route.guildId ?? "",
+          channelId: route.channelId ?? null,
+          workspaceKey: route.workspaceKey ?? "",
+          createdAt: route.createdAt,
+          updatedAt: route.updatedAt,
+        })),
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return null;
+      }
+      return null;
+    }
+  }
+
   private async flush(): Promise<void> {
     this.writeQueue = this.writeQueue.then(async () => {
       const payload: OakAccessConfigFile = {
@@ -447,8 +504,12 @@ export class OakAccessConfigStore {
         workspaces: this.listWorkspaces(),
         routes: this.listRoutes(),
       };
+      const serialized = `${JSON.stringify(payload, null, 2)}\n`;
+      const tempFilePath = `${this.filePath}.tmp`;
 
-      await writeFile(this.filePath, `${JSON.stringify(payload, null, 2)}\n`);
+      await writeFile(tempFilePath, serialized);
+      await rename(tempFilePath, this.filePath);
+      await writeFile(this.backupFilePath, serialized);
     });
 
     await this.writeQueue;

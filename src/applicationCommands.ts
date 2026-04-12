@@ -22,12 +22,14 @@ export function getOakApplicationCommandData(): ReturnType<
                 option
                   .setName("key")
                   .setDescription("Workspace key, for example app")
+                  .setAutocomplete(true)
                   .setRequired(true),
               )
               .addStringOption((option) =>
                 option
                   .setName("root")
                   .setDescription("Absolute or relative filesystem path")
+                  .setAutocomplete(true)
                   .setRequired(true),
               ),
           )
@@ -39,6 +41,7 @@ export function getOakApplicationCommandData(): ReturnType<
                 option
                   .setName("key")
                   .setDescription("Workspace key")
+                  .setAutocomplete(true)
                   .setRequired(true),
               ),
           )
@@ -62,6 +65,7 @@ export function getOakApplicationCommandData(): ReturnType<
                 option
                   .setName("workspace")
                   .setDescription("Workspace key")
+                  .setAutocomplete(true)
                   .setRequired(true),
               )
               .addChannelOption((option) =>
@@ -100,6 +104,7 @@ export function getOakApplicationCommandData(): ReturnType<
                 option
                   .setName("workspace")
                   .setDescription("Workspace key")
+                  .setAutocomplete(true)
                   .setRequired(true),
               )
               .addUserOption((option) =>
@@ -117,6 +122,7 @@ export function getOakApplicationCommandData(): ReturnType<
                 option
                   .setName("workspace")
                   .setDescription("Workspace key")
+                  .setAutocomplete(true)
                   .setRequired(true),
               )
               .addUserOption((option) =>
@@ -134,6 +140,7 @@ export function getOakApplicationCommandData(): ReturnType<
                 option
                   .setName("workspace")
                   .setDescription("Workspace key")
+                  .setAutocomplete(true)
                   .setRequired(true),
               ),
           ),

@@ -105,7 +105,7 @@ const oakAccessConfigStore = new OakAccessConfigStore(
   oakBootstrapConfig,
 );
 const sessions = new Map<string, SessionContext>();
-const OAK_RESTART_CONTINUE_TEXT = "continue";
+const OAK_RESTART_CONTINUE_TEXT = "Codex was restarted. Continue.";
 let oakModelOptionsCache: {
   expiresAt: number;
   data: OakModelOption[];

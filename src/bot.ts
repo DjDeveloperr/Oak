@@ -2633,6 +2633,14 @@ function formatCommandResultSummary(
   return parts.join("\n");
 }
 
+function formatCommandResultCodeBlock(
+  title: string,
+  result: OakCommandResult,
+): string {
+  const body = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  return `${title}\n${formatCodeBlock("", body || "Done.")}`;
+}
+
 async function generateCommitMessageWithCodex(
   workspaceRoot: string,
 ): Promise<string> {
@@ -2696,6 +2704,56 @@ async function handleGitCommand(
   try {
     const workspaceRoot = scope.workspace.root;
 
+    if (command === "upgrade") {
+      if (!isOakAdminUserId(message.author.id)) {
+        await sendMessageReplyText(
+          message,
+          "Only the Oak owner can run upgrade.",
+        );
+        return true;
+      }
+      if (!supervisorControlsRestart()) {
+        await sendMessageReplyText(
+          message,
+          "Upgrade requires Oak to be started through the supervisor.",
+        );
+        return true;
+      }
+
+      const pullResult = await runGitCommand(workspaceRoot, ["pull", "--ff-only"]);
+      await sendMessageReplyText(
+        message,
+        formatCommandResultSummary("Ran `git pull --ff-only`.", pullResult),
+      );
+
+      const buildResult = await execFileAsync("npm", ["run", "build"], {
+        cwd: workspaceRoot,
+        maxBuffer: 1024 * 1024 * 8,
+      });
+      await sendMessageReplyText(
+        message,
+        [
+          "Ran `npm run build`.",
+          formatCodeBlock(
+            "",
+            [buildResult.stdout.trim(), buildResult.stderr.trim()]
+              .filter(Boolean)
+              .join("\n") || "Done.",
+          ),
+          "Stopping the Oak supervisor so PM2 restarts the full stack.",
+        ].join("\n"),
+      );
+
+      setTimeout(() => {
+        try {
+          process.kill(process.ppid, "SIGTERM");
+        } catch {
+          process.exit(0);
+        }
+      }, 250).unref();
+      return true;
+    }
+
     if (command === "pull") {
       const result = await runGitCommand(workspaceRoot, ["pull", "--ff-only"]);
       await sendMessageReplyText(
@@ -2709,7 +2767,7 @@ async function handleGitCommand(
       const result = await runGitCommand(workspaceRoot, ["push"]);
       await sendMessageReplyText(
         message,
-        formatCommandResultSummary("Ran `git push`.", result),
+        formatCommandResultCodeBlock("Ran `git push`.", result),
       );
       return true;
     }
@@ -2720,7 +2778,7 @@ async function handleGitCommand(
         const pushResult = await runGitCommand(workspaceRoot, ["push"]);
         await sendMessageReplyText(
           message,
-          formatCommandResultSummary(
+          formatCommandResultCodeBlock(
             "Nothing to commit. Ran `git push`.",
             pushResult,
           ),
@@ -2761,7 +2819,7 @@ async function handleGitCommand(
       [
         `Created commit: \`${commitMessage}\``,
         formatCommandResultSummary("Ran `git commit`.", commitResult),
-        formatCommandResultSummary("Ran `git push`.", pushResult),
+        formatCommandResultCodeBlock("Ran `git push`.", pushResult),
       ].join("\n"),
     );
     return true;
@@ -2900,7 +2958,8 @@ function getGitCommandText(message: Message, botUserId: string): string | null {
     normalized === "pull" ||
     normalized === "push" ||
     normalized === "commit" ||
-    normalized === "yolo"
+    normalized === "yolo" ||
+    normalized === "upgrade"
   ) {
     return normalized;
   }

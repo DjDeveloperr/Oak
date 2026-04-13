@@ -34,6 +34,12 @@ export interface SessionRecord extends OakThreadPreferences {
   pendingRestartContinueAt: string | null;
   rolloutReadOffset: number;
   lastAssistantResponse: string | null;
+  lastCodexOutputKind:
+    | "reasoning"
+    | "command_execution"
+    | "commentary"
+    | "final_answer"
+    | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -131,6 +137,13 @@ export class SessionStore {
             typeof record.lastAssistantResponse === "string" &&
             record.lastAssistantResponse.trim()
               ? record.lastAssistantResponse
+              : null,
+          lastCodexOutputKind:
+            record.lastCodexOutputKind === "reasoning" ||
+            record.lastCodexOutputKind === "command_execution" ||
+            record.lastCodexOutputKind === "commentary" ||
+            record.lastCodexOutputKind === "final_answer"
+              ? record.lastCodexOutputKind
               : null,
           createdAt: record.createdAt,
           updatedAt: record.updatedAt,

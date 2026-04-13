@@ -945,6 +945,21 @@ function sessionHasActiveWork(
   );
 }
 
+function sessionNeedsContinueAfterStartup(
+  session: SessionContext | SessionRecord,
+): boolean {
+  const record = "record" in session ? session.record : session;
+  if (record.pendingRestartContinue) {
+    return true;
+  }
+
+  if (!sessionHasActiveWork(record)) {
+    return false;
+  }
+
+  return record.lastCodexOutputKind !== "final_answer";
+}
+
 function buildSyntheticTextInput(text: string): OakUserInput[] {
   return [
     {
@@ -1184,6 +1199,26 @@ async function setSessionPendingRestartContinue(
     pendingRestartContinueAt: pending ? new Date().toISOString() : null,
     activeTurnId: pending ? null : session.record.activeTurnId,
     streamingActive: pending ? false : session.record.streamingActive,
+    updatedAt: new Date().toISOString(),
+  };
+  await persistSession(session);
+}
+
+async function setSessionCodexOutputKind(
+  session: SessionContext,
+  kind:
+    | "reasoning"
+    | "command_execution"
+    | "commentary"
+    | "final_answer",
+): Promise<void> {
+  if (session.record.lastCodexOutputKind === kind) {
+    return;
+  }
+
+  session.record = {
+    ...session.record,
+    lastCodexOutputKind: kind,
     updatedAt: new Date().toISOString(),
   };
   await persistSession(session);
@@ -1487,6 +1522,11 @@ async function resumeSessionAfterCodexRestart(
       await ensureSessionReady(session);
 
       if (sessionHasActiveStreaming(session)) {
+        session.rolloutReadOffset = session.record.rolloutReadOffset;
+        session.rolloutLineRemainder = "";
+        setTyping(session, true);
+        startRolloutPolling(session);
+        await pollRolloutFile(session);
         await setSessionPendingRestartContinue(session, false);
         session.restartResumeAttempt = 0;
         return;
@@ -1576,6 +1616,7 @@ async function handleSessionEvent(
       }
       return;
     case "reasoning":
+      await setSessionCodexOutputKind(session, "reasoning");
       {
         const eventKey = buildStreamedOutputKey([
           event.type,
@@ -1592,6 +1633,7 @@ async function handleSessionEvent(
       await sendCompactText(session.thread, event.text);
       return;
     case "command_execution":
+      await setSessionCodexOutputKind(session, "command_execution");
       {
         const eventKey = buildStreamedOutputKey([
           event.type,
@@ -1609,6 +1651,7 @@ async function handleSessionEvent(
       return;
     case "assistant_message":
       if (event.phase === "commentary") {
+        await setSessionCodexOutputKind(session, "commentary");
         if (session.lastCommentaryTurnId !== event.turnId) {
           resetCommentaryState(session, event.turnId);
         }
@@ -1646,6 +1689,7 @@ async function handleSessionEvent(
       session.record = {
         ...session.record,
         lastAssistantResponse: event.text,
+        lastCodexOutputKind: "final_answer",
         updatedAt: new Date().toISOString(),
       };
       await persistSession(session);
@@ -2285,6 +2329,7 @@ async function createFreshSession(
       pendingRestartContinueAt: null,
       rolloutReadOffset: 0,
       lastAssistantResponse: null,
+      lastCodexOutputKind: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }),
@@ -2563,68 +2608,20 @@ async function restartCodex(): Promise<void> {
   }
 }
 
-async function recoverStreamingSessions(discordClient: Client): Promise<void> {
-  const activeRecords = sessionStore
-    .list()
-    .filter((record) => record.streamingActive && record.codexThreadId);
-
-  for (const record of activeRecords) {
-    try {
-      const channel = await discordClient.channels.fetch(
-        record.discordThreadId,
-      );
-      if (!channel?.isThread()) {
-        log("Skipping Oak session recovery for non-thread channel", {
-          discordThreadId: record.discordThreadId,
-        });
-        continue;
-      }
-
-      const session = await getOrCreateSession(channel);
-      if (!session) {
-        continue;
-      }
-
-      await ensureSessionReady(session);
-      if (!sessionHasActiveStreaming(session)) {
-        continue;
-      }
-
-      resetCommentaryState(session, session.record.activeTurnId);
-      session.rolloutReadOffset = session.record.rolloutReadOffset;
-      session.rolloutLineRemainder = "";
-      setTyping(session, true);
-      startRolloutPolling(session);
-      await pollRolloutFile(session);
-
-      log("Recovered active Oak stream", {
-        discordThreadId: session.thread.id,
-        codexThreadId: session.record.codexThreadId,
-        activeTurnId: session.record.activeTurnId,
-      });
-    } catch (error) {
-      console.error("[oak] Failed to recover streaming session:", {
-        discordThreadId: record.discordThreadId,
-        error,
-      });
-    }
-  }
-}
-
-async function recoverPendingRestartContinueSessions(
+async function recoverInterruptedSessionsOnStartup(
   discordClient: Client,
 ): Promise<void> {
-  const pendingRecords = sessionStore
+  const candidateRecords = sessionStore
     .list()
-    .filter((record) => record.pendingRestartContinue && record.codexThreadId);
+    .filter((record) => record.codexThreadId && sessionNeedsContinueAfterStartup(record));
 
-  for (const record of pendingRecords) {
+  for (const record of candidateRecords) {
     try {
       const channel = await discordClient.channels.fetch(
         record.discordThreadId,
       );
       if (!channel?.isThread()) {
-        log("Skipping Oak restart-continue recovery for non-thread channel", {
+        log("Skipping Oak startup recovery for non-thread channel", {
           discordThreadId: record.discordThreadId,
         });
         continue;
@@ -2635,9 +2632,12 @@ async function recoverPendingRestartContinueSessions(
         continue;
       }
 
+      if (!sessionHasPendingRestartContinue(session)) {
+        await setSessionPendingRestartContinue(session, true);
+      }
       scheduleSessionRestartResume(session);
     } catch (error) {
-      console.error("[oak] Failed to recover restart-continue session:", {
+      console.error("[oak] Failed to recover interrupted session:", {
         discordThreadId: record.discordThreadId,
         error,
       });
@@ -3964,12 +3964,8 @@ export async function main(): Promise<void> {
       console.error("[oak] Active Codex profile sync failed:", error);
     });
 
-    void recoverStreamingSessions(readyClient).catch((error) => {
-      console.error("[oak] Session recovery failed:", error);
-    });
-
-    void recoverPendingRestartContinueSessions(readyClient).catch((error) => {
-      console.error("[oak] Restart-continue recovery failed:", error);
+    void recoverInterruptedSessionsOnStartup(readyClient).catch((error) => {
+      console.error("[oak] Interrupted session recovery failed:", error);
     });
   });
 

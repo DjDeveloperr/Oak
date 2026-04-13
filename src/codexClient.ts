@@ -544,6 +544,22 @@ export class OakCodexClient {
     );
   }
 
+  async archiveThread(threadId?: string | null): Promise<void> {
+    await this.ensureConnected();
+    const targetThreadId = threadId ?? this.threadId;
+    if (!targetThreadId) {
+      throw new Error("codex_thread_not_started");
+    }
+
+    await this.request(
+      "thread/archive",
+      {
+        threadId: targetThreadId,
+      },
+      15000,
+    );
+  }
+
   async readThreadMetadata(): Promise<OakThreadMetadata> {
     if (!this.threadId) {
       throw new Error("codex_thread_not_started");

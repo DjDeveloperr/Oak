@@ -20,7 +20,9 @@ import {
   type TextChannel,
   type ThreadChannel,
 } from "discord.js";
+import { execFile } from "node:child_process";
 import { mkdir, open, readdir, stat, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import path from "node:path";
 import {
   OakCodexClient,
@@ -75,6 +77,7 @@ const DISCORD_MESSAGE_LIMIT = 2000;
 const DISCORD_INLINE_COMMAND_LIMIT = 500;
 const DISCORD_CODE_BLOCK_LIMIT = 1900;
 const OAK_MODEL_OPTIONS_CACHE_TTL_MS = 5 * 60 * 1000;
+const execFileAsync = promisify(execFile);
 
 interface SessionContext {
   record: SessionRecord;
@@ -97,6 +100,11 @@ interface SessionContext {
   rolloutLineRemainder: string;
   lastReportedErrorText: string | null;
   lastReportedErrorAt: number;
+}
+
+interface OakCommandResult {
+  stdout: string;
+  stderr: string;
 }
 
 const sessionStore = new SessionStore(oakConfig.sessionsPath);
@@ -756,6 +764,22 @@ function isSupportedTextChannel(message: Message): message is Message<true> & {
   channel: TextChannel;
 } {
   return message.channel.type === ChannelType.GuildText;
+}
+
+async function sendMessageReplyText(
+  message: Message,
+  text: string,
+): Promise<void> {
+  const chunks = splitDiscordText(text);
+  if (chunks.length === 0) {
+    await message.reply("\u200b");
+    return;
+  }
+
+  await message.reply(withSafeDiscordContent({ content: chunks[0] }));
+  for (const chunk of chunks.slice(1)) {
+    await message.reply(withSafeDiscordContent({ content: chunk }));
+  }
 }
 
 function shouldStartInThread(message: Message, botUserId: string): boolean {
@@ -2573,6 +2597,181 @@ async function sendRestoredResponse(
   }
 }
 
+async function runGitCommand(
+  workspaceRoot: string,
+  args: string[],
+): Promise<OakCommandResult> {
+  const { stdout, stderr } = await execFileAsync("git", args, {
+    cwd: workspaceRoot,
+    maxBuffer: 1024 * 1024 * 8,
+  });
+  return {
+    stdout: stdout.trim(),
+    stderr: stderr.trim(),
+  };
+}
+
+async function getWorkspaceGitStatus(workspaceRoot: string): Promise<string> {
+  const { stdout } = await runGitCommand(workspaceRoot, ["status", "--short"]);
+  return stdout;
+}
+
+function formatCommandResultSummary(
+  title: string,
+  result: OakCommandResult,
+): string {
+  const parts = [title];
+  if (result.stdout) {
+    parts.push(result.stdout);
+  }
+  if (result.stderr) {
+    parts.push(result.stderr);
+  }
+  if (parts.length === 1) {
+    parts.push("Done.");
+  }
+  return parts.join("\n");
+}
+
+async function generateCommitMessageWithCodex(
+  workspaceRoot: string,
+): Promise<string> {
+  let finalAnswer = "";
+  const tempClient = createCodexClientForPreferences(
+    buildOakThreadPreferences(oakConfig.model, oakConfig.reasoningEffort),
+    oakConfig.serviceTier,
+    (event) => {
+      if (event.type === "assistant_message" && event.phase === "final_answer") {
+        finalAnswer = event.text.trim();
+      }
+    },
+    workspaceRoot,
+  );
+
+  try {
+    await tempClient.ensureConnected();
+    await tempClient.startThread("Oak commit message");
+    await tempClient.startTurn(
+      buildSyntheticTextInput(
+        [
+          "Inspect the current git diff for this repository and generate a concise commit message.",
+          "Requirements:",
+          "- Output exactly one git commit message line.",
+          "- Use imperative mood.",
+          "- No backticks, quotes, code fences, bullets, or explanations.",
+          "- Do not modify any files or run any write commands.",
+        ].join("\n"),
+      ),
+    );
+
+    const message = finalAnswer
+      .split(/\r?\n/)
+      .map((line) => normalizeWhitespace(line))
+      .find(Boolean);
+    if (!message) {
+      throw new Error("Codex did not return a commit message.");
+    }
+
+    return message;
+  } finally {
+    await tempClient.archiveThread().catch(() => {});
+    await tempClient.close(true);
+  }
+}
+
+async function handleGitCommand(
+  message: Message,
+  botUserId: string,
+): Promise<boolean> {
+  const command = getGitCommandText(message, botUserId);
+  if (!command) {
+    return false;
+  }
+
+  const scope = getAllowedWorkspaceForMessage(message);
+  if (!scope) {
+    return true;
+  }
+
+  try {
+    const workspaceRoot = scope.workspace.root;
+
+    if (command === "pull") {
+      const result = await runGitCommand(workspaceRoot, ["pull", "--ff-only"]);
+      await sendMessageReplyText(
+        message,
+        formatCommandResultSummary("Ran `git pull --ff-only`.", result),
+      );
+      return true;
+    }
+
+    if (command === "push") {
+      const result = await runGitCommand(workspaceRoot, ["push"]);
+      await sendMessageReplyText(
+        message,
+        formatCommandResultSummary("Ran `git push`.", result),
+      );
+      return true;
+    }
+
+    const status = await getWorkspaceGitStatus(workspaceRoot);
+    if (!status) {
+      if (command === "yolo") {
+        const pushResult = await runGitCommand(workspaceRoot, ["push"]);
+        await sendMessageReplyText(
+          message,
+          formatCommandResultSummary(
+            "Nothing to commit. Ran `git push`.",
+            pushResult,
+          ),
+        );
+        return true;
+      }
+
+      await sendMessageReplyText(message, "Nothing to commit.");
+      return true;
+    }
+
+    await sendMessageReplyText(
+      message,
+      "Generating a commit message with Codex and creating the commit.",
+    );
+    const commitMessage = await generateCommitMessageWithCodex(workspaceRoot);
+    await runGitCommand(workspaceRoot, ["add", "-A"]);
+    const commitResult = await runGitCommand(workspaceRoot, [
+      "commit",
+      "-m",
+      commitMessage,
+    ]);
+
+    if (command === "commit") {
+      await sendMessageReplyText(
+        message,
+        [
+          `Created commit: \`${commitMessage}\``,
+          formatCommandResultSummary("Ran `git commit`.", commitResult),
+        ].join("\n"),
+      );
+      return true;
+    }
+
+    const pushResult = await runGitCommand(workspaceRoot, ["push"]);
+    await sendMessageReplyText(
+      message,
+      [
+        `Created commit: \`${commitMessage}\``,
+        formatCommandResultSummary("Ran `git commit`.", commitResult),
+        formatCommandResultSummary("Ran `git push`.", pushResult),
+      ].join("\n"),
+    );
+    return true;
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : String(error);
+    await sendMessageReplyText(message, `Git command failed.\n${messageText}`);
+    return true;
+  }
+}
+
 async function restartCodex(): Promise<void> {
   const sessionsToResume = [...sessions.values()].filter((session) =>
     sessionHasActiveWork(session),
@@ -2693,6 +2892,20 @@ function isCodexSwitchCommandMessage(
 
 function isModelCommandMessage(message: Message, botUserId: string): boolean {
   return getMentionCommandText(message, botUserId) === "model";
+}
+
+function getGitCommandText(message: Message, botUserId: string): string | null {
+  const normalized = getMentionCommandText(message, botUserId);
+  if (
+    normalized === "pull" ||
+    normalized === "push" ||
+    normalized === "commit" ||
+    normalized === "yolo"
+  ) {
+    return normalized;
+  }
+
+  return null;
 }
 
 async function sendThreadPreferencePanel(
@@ -3859,6 +4072,10 @@ async function handleMessage(
   }
 
   if (await handleRateLimitsCommand(message, botUserId)) {
+    return;
+  }
+
+  if (await handleGitCommand(message, botUserId)) {
     return;
   }
 

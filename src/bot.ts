@@ -909,9 +909,8 @@ async function sendFinalAnswer(
   text: string,
 ): Promise<void> {
   const normalizedText = rewriteDiscordFileReferences(text);
-  const mentionPrefix = session.record.lastInteractorUserId
-    ? `<@${session.record.lastInteractorUserId}>\n`
-    : "";
+  const mentionUserId = session.record.lastInteractorUserId;
+  const mentionPrefix = mentionUserId ? `<@${mentionUserId}>\n` : "";
   const chunks = splitDiscordText(
     normalizedText,
     DISCORD_MESSAGE_LIMIT - mentionPrefix.length,
@@ -919,12 +918,18 @@ async function sendFinalAnswer(
 
   if (chunks.length === 0) {
     if (mentionPrefix) {
-      await session.thread.send(mentionPrefix.trim());
+      await session.thread.send({
+        content: mentionPrefix.trim(),
+        allowedMentions: { users: mentionUserId ? [mentionUserId] : [] },
+      });
     }
     return;
   }
 
-  await session.thread.send(`${mentionPrefix}${chunks[0]}`);
+  await session.thread.send({
+    content: `${mentionPrefix}${chunks[0]}`,
+    allowedMentions: { users: mentionUserId ? [mentionUserId] : [] },
+  });
   for (const chunk of chunks.slice(1)) {
     await session.thread.send(chunk);
   }
@@ -1710,6 +1715,7 @@ async function handleSessionEvent(
       }
 
       resetCommentaryState(session);
+      setTyping(session, false);
       session.record = {
         ...session.record,
         lastAssistantResponse: event.text,

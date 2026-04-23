@@ -29,6 +29,7 @@ const CODEX_ACTIVE_PROFILE_PATH = path.join(
 const CODEX_CURRENT_PROFILE_PATH = path.join(homedir(), ".codex_current");
 const CODEX_AUTH_DIR = path.join(homedir(), ".codex");
 const CODEX_AUTH_PATH = path.join(CODEX_AUTH_DIR, "auth.json");
+let gitOperationQueue = Promise.resolve();
 
 export interface CodexSwitchMenuState {
   activeProfile: string | null;
@@ -61,15 +62,7 @@ function toTildePath(value: string): string {
 }
 
 async function runGitRefreshStep(args: string[]): Promise<void> {
-  try {
-    await execFileAsync("git", args, {
-      cwd: CODEX_PROFILES_DIR,
-    });
-  } catch (error) {
-    throw new Error(
-      `git ${args.join(" ")} failed in ${toTildePath(CODEX_PROFILES_DIR)}: ${asErrorMessage(error)}`,
-    );
-  }
+  await runSerializedGitCommand(args);
 }
 
 export async function refreshCodexProfiles(): Promise<void> {
@@ -132,13 +125,13 @@ function toRepoRelativePath(filePath: string): string {
 
 async function hasGitChangesForPaths(paths: string[]): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["status", "--short", "--untracked-files=all", "--", ...paths],
-      {
-        cwd: CODEX_PROFILES_DIR,
-      },
-    );
+    const { stdout } = await runSerializedGitCommand([
+      "status",
+      "--short",
+      "--untracked-files=all",
+      "--",
+      ...paths,
+    ]);
     return stdout.trim().length > 0;
   } catch (error) {
     throw new Error(
@@ -158,20 +151,56 @@ async function pushCodexProfileChanges(changedPaths: string[]): Promise<void> {
   }
 
   try {
-    await execFileAsync("git", ["add", "--", ...repoPaths], {
-      cwd: CODEX_PROFILES_DIR,
-    });
-    await execFileAsync("git", ["commit", "-m", "update", "--", ...repoPaths], {
-      cwd: CODEX_PROFILES_DIR,
-    });
-    await execFileAsync("git", ["push"], {
-      cwd: CODEX_PROFILES_DIR,
-    });
+    await runSerializedGitCommand(["add", "--", ...repoPaths]);
+    await runSerializedGitCommand(["commit", "-m", "update", "--", ...repoPaths]);
+    await runSerializedGitCommand(["push"]);
   } catch (error) {
     throw new Error(
       `Failed to push Codex profile updates from ${toTildePath(CODEX_PROFILES_DIR)}: ${asErrorMessage(error)}`,
     );
   }
+}
+
+async function runSerializedGitCommand(
+  args: string[],
+): Promise<{ stdout: string; stderr: string }> {
+  const run = async (): Promise<{ stdout: string; stderr: string }> => {
+    try {
+      const { stdout, stderr } = await execFileAsync("git", args, {
+        cwd: CODEX_PROFILES_DIR,
+      });
+      return {
+        stdout: stdout ?? "",
+        stderr: stderr ?? "",
+      };
+    } catch (error) {
+      const details =
+        error && typeof error === "object"
+          ? [
+              "stdout" in error && typeof error.stdout === "string"
+                ? error.stdout.trim()
+                : "",
+              "stderr" in error && typeof error.stderr === "string"
+                ? error.stderr.trim()
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n")
+          : "";
+
+      const suffix = details ? `\n${details}` : "";
+      throw new Error(
+        `git ${args.join(" ")} failed in ${toTildePath(CODEX_PROFILES_DIR)}: ${asErrorMessage(error)}${suffix}`,
+      );
+    }
+  };
+
+  const pending = gitOperationQueue.then(run, run);
+  gitOperationQueue = pending.then(
+    () => undefined,
+    () => undefined,
+  );
+  return pending;
 }
 
 async function persistTrackedActiveCodexProfile(profile: string): Promise<void> {

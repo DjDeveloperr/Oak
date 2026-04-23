@@ -529,19 +529,25 @@ export class OakCodexClient {
     await this.ensureConnected();
     this.threadId = threadId;
 
-    await this.request(
-      "thread/resume",
-      {
-        threadId,
-        cwd: this.options.cwd,
-        approvalPolicy: this.options.approvalPolicy,
-        sandbox: this.options.threadSandbox,
-        model: this.options.model,
-        serviceTier: this.options.serviceTier,
-        persistExtendedHistory: true,
-      },
-      15000,
-    );
+    try {
+      await this.request(
+        "thread/resume",
+        {
+          threadId,
+          cwd: this.options.cwd,
+          approvalPolicy: this.options.approvalPolicy,
+          sandbox: this.options.threadSandbox,
+          model: this.options.model,
+          serviceTier: this.options.serviceTier,
+          persistExtendedHistory: true,
+        },
+        15000,
+      );
+    } catch (error) {
+      this.threadId = null;
+      this.activeTurnId = null;
+      throw error;
+    }
   }
 
   async archiveThread(threadId?: string | null): Promise<void> {
@@ -732,7 +738,7 @@ export class OakCodexClient {
     }
   }
 
-  async interruptTurn(): Promise<void> {
+  async interruptTurn(): Promise<string> {
     if (!this.threadId || (!this.currentTurn && !this.resumedTurnActive)) {
       throw new Error("codex_turn_not_running");
     }
@@ -749,14 +755,40 @@ export class OakCodexClient {
       throw new Error("codex_turn_id_unavailable");
     }
 
-    await this.request(
-      "turn/interrupt",
-      {
-        threadId: this.threadId,
-        turnId,
-      },
-      15000,
-    );
+    try {
+      await this.request(
+        "turn/interrupt",
+        {
+          threadId: this.threadId,
+          turnId,
+        },
+        15000,
+      );
+      return turnId;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!isActiveTurnMismatchError(message)) {
+        throw error;
+      }
+
+      const recoveredTurnId =
+        extractMismatchedTurnId(message, turnId) ??
+        (await this.refreshTurnStateFromThread());
+      if (!recoveredTurnId || recoveredTurnId === turnId) {
+        throw error;
+      }
+
+      this.activeTurnId = recoveredTurnId;
+      await this.request(
+        "turn/interrupt",
+        {
+          threadId: this.threadId,
+          turnId: recoveredTurnId,
+        },
+        15000,
+      );
+      return recoveredTurnId;
+    }
   }
 
   markTurnAborted(reason: string, turnId?: string | null): void {
@@ -1158,12 +1190,7 @@ export class OakCodexClient {
     }
 
     if (item.type === "commandExecution" && typeof item.command === "string") {
-      this.options.onEvent({
-        type: "command_execution",
-        threadId,
-        turnId,
-        command: item.command,
-      });
+      return;
     }
   }
 

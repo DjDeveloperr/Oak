@@ -7,8 +7,8 @@ import {
   type MessageActionRowComponentBuilder,
 } from "discord.js";
 
-export const DEFAULT_OAK_MODEL = "gpt-5.4";
-export const DEFAULT_OAK_REASONING_EFFORT = "medium";
+export const DEFAULT_OAK_MODEL = "gpt-5.5";
+export const DEFAULT_OAK_REASONING_EFFORT = "high";
 export const OAK_FAST_MODE_MODEL = "gpt-5.4-mini";
 export const OAK_FAST_MODE_REASONING_EFFORT = "low";
 
@@ -75,12 +75,19 @@ const STATIC_REASONING_OPTIONS: readonly OakReasoningOption[] = [
 
 const STATIC_MODEL_OPTIONS: readonly OakModelOption[] = [
   {
+    value: "gpt-5.5",
+    label: "GPT-5.5",
+    description: "Frontier model for complex coding and long-running work.",
+    defaultReasoningEffort: "high",
+    supportedReasoningEfforts: STATIC_REASONING_OPTIONS,
+    isDefault: true,
+  },
+  {
     value: "gpt-5.4",
     label: "GPT-5.4",
     description: "Latest frontier agentic coding model.",
     defaultReasoningEffort: "medium",
     supportedReasoningEfforts: STATIC_REASONING_OPTIONS,
-    isDefault: true,
   },
   {
     value: "gpt-5.4-mini",

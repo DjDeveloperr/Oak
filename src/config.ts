@@ -3,7 +3,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config as loadDotEnv } from "dotenv";
 import type { OakAccessConfigSnapshot } from "./accessConfig.js";
-import { DEFAULT_OAK_MODEL } from "./threadPreferences.js";
+import {
+  DEFAULT_OAK_MODEL,
+  DEFAULT_OAK_REASONING_EFFORT,
+} from "./threadPreferences.js";
 
 function findUp(startDir: string, marker: string): string | null {
   let currentDir = startDir;
@@ -128,10 +131,11 @@ export const oakConfig = {
   turnSandboxPolicy: buildOakTurnSandboxPolicy(),
   model: (process.env.OAK_CODEX_MODEL ?? "").trim() || DEFAULT_OAK_MODEL,
   reasoningEffort:
-    (process.env.OAK_CODEX_REASONING_EFFORT ?? "").trim() || null,
+    (process.env.OAK_CODEX_REASONING_EFFORT ?? "").trim() ||
+    DEFAULT_OAK_REASONING_EFFORT,
   reasoningSummary:
     (process.env.OAK_CODEX_REASONING_SUMMARY ?? "concise").trim() || null,
-  serviceTier: (process.env.OAK_CODEX_SERVICE_TIER ?? "").trim() || null,
+  serviceTier: (process.env.OAK_CODEX_SERVICE_TIER ?? "").trim() || "fast",
   turnTimeoutMs: parseInteger(process.env.OAK_TURN_TIMEOUT_MS, 60 * 60 * 1000),
   typingIntervalMs: parseInteger(process.env.OAK_TYPING_INTERVAL_MS, 8000),
   dryRun: process.env.OAK_DRY_RUN === "1",

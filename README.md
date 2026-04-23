@@ -101,6 +101,9 @@ Slash command:
 
 Oak currently starts Codex with:
 
+- model `gpt-5.5`
+- reasoning effort `high`
+- service tier `fast`
 - approval policy `never`
 - sandbox mode `danger-full-access`
 

@@ -98,6 +98,7 @@ interface SessionContext {
   restartResumeAttempt: number;
   rolloutReadOffset: number;
   rolloutLineRemainder: string;
+  interruptingTurnId: string | null;
   lastReportedErrorText: string | null;
   lastReportedErrorAt: number;
 }
@@ -445,32 +446,6 @@ function extractCommentaryDelta(
   }
 
   return nextText.trim();
-}
-
-function extractReasoningTextFromRollout(
-  payload: Record<string, unknown>,
-): string | null {
-  if (!Array.isArray(payload.summary)) {
-    return null;
-  }
-
-  const text = payload.summary
-    .flatMap((entry) => {
-      if (
-        typeof entry === "object" &&
-        entry !== null &&
-        (entry as { type?: unknown }).type === "summary_text" &&
-        typeof (entry as { text?: unknown }).text === "string"
-      ) {
-        return [(entry as { text: string }).text.trim()];
-      }
-      return [];
-    })
-    .filter(Boolean)
-    .join("\n")
-    .trim();
-
-  return text || null;
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> | null {
@@ -947,6 +922,21 @@ function sessionHasActiveStreaming(session: SessionContext): boolean {
   return session.record.streamingActive;
 }
 
+function sessionNeedsRolloutRecovery(session: SessionContext): boolean {
+  return (
+    !session.client.isWorking &&
+    (sessionHasActiveStreaming(session) ||
+      sessionHasPendingRestartContinue(session))
+  );
+}
+
+function isSuppressedInterruptedTurn(
+  session: SessionContext,
+  turnId: string | null | undefined,
+): boolean {
+  return !!session.interruptingTurnId && turnId === session.interruptingTurnId;
+}
+
 function sessionHasPendingRestartContinue(
   session: SessionContext | SessionRecord,
 ): boolean {
@@ -1055,6 +1045,15 @@ function isTransientCodexConnectionError(message: string): boolean {
   );
 }
 
+function isMissingCodexRolloutResumeError(error: unknown): boolean {
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return (
+    message.includes("codex_request_error: thread/resume:") &&
+    message.includes("no rollout found")
+  );
+}
+
 function shouldOfferCodexSwitch(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -1109,27 +1108,68 @@ async function buildCodexSwitchPanelPayload(options: {
   });
 }
 
-async function offerCodexSwitchAfterError(
+async function switchCodexProfileWithStatus(
+  selectedProfile: string,
+): Promise<string> {
+  const result = await switchCodexProfile(selectedProfile);
+  const statusLines: string[] = [];
+  if (result.previousProfilePath) {
+    statusLines.push(
+      `Saved the outgoing live auth for \`${result.previousProfile}\` to \`${result.previousProfilePath}\`.`,
+    );
+  } else if (!result.previousProfile) {
+    statusLines.push(
+      "No active Codex profile was detected before this switch, so there was no previous profile auth to save.",
+    );
+  } else if (!result.previousProfileHadLiveAuth) {
+    statusLines.push(
+      `Active Codex profile was \`${result.previousProfile}\`, but \`~/.codex/auth.json\` was missing so there was no live auth to save back first.`,
+    );
+  }
+  statusLines.push(`Switched Codex profile to \`${selectedProfile}\`.`);
+  statusLines.push(`\`${result.sourcePath}\` -> \`${result.destinationPath}\``);
+  return statusLines.join("\n");
+}
+
+async function autoSwitchCodexProfileAfterError(
   session: SessionContext,
   message: string,
 ): Promise<void> {
-  if (
-    !shouldOfferCodexSwitch(message) ||
-    !session.record.lastInteractorUserId
-  ) {
+  if (!shouldOfferCodexSwitch(message)) {
     return;
   }
 
-  await session.thread.send(
-    withSafeDiscordContent(
-      await buildCodexSwitchPanelPayload({
-        userId: session.record.lastInteractorUserId,
-        refresh: true,
-        statusText:
-          "Codex reported an account or limit error. Pick a profile to switch.",
-      }),
-    ),
-  );
+  const activeProfile = await syncActiveCodexProfile();
+  const summary = await getOakRateLimitSummary({
+    cwd: oakConfig.repoRoot,
+    excludeProfileNames: ["codex", activeProfile ?? ""],
+  });
+  const selectedProfile = summary.bestProfileName;
+
+  if (!selectedProfile) {
+    await sendSmallText(
+      session.thread,
+      "Account Switch",
+      activeProfile
+        ? `Codex reported an account or limit error, but no better non-\`codex\` profile was available to switch from \`${activeProfile}\`.`
+        : "Codex reported an account or limit error, but no eligible non-`codex` profile was available to switch to.",
+    );
+    return;
+  }
+
+  const statusLines = [
+    "Codex reported an account or limit error. Switching to the best available non-`codex` profile and restarting Codex.",
+  ];
+
+  try {
+    statusLines.push(await switchCodexProfileWithStatus(selectedProfile));
+    await restartCodex();
+    statusLines.push("Requested a Codex app-server restart.");
+  } catch (error) {
+    statusLines.push(error instanceof Error ? error.message : String(error));
+  }
+
+  await sendSmallText(session.thread, "Account Switch", statusLines.join("\n"));
 }
 
 async function reportSessionError(
@@ -1141,11 +1181,22 @@ async function reportSessionError(
   }
 
   await sendSmallText(session.thread, "Error", message);
-  await offerCodexSwitchAfterError(session, message);
+  await autoSwitchCodexProfileAfterError(session, message);
 }
 
 async function persistSession(session: SessionContext): Promise<void> {
   await sessionStore.set(session.record);
+}
+
+async function sendSessionThreadInfoMessage(session: SessionContext): Promise<void> {
+  const workspace = getSessionWorkspace(session);
+  const message = await session.thread.send(
+    [
+      `Codex thread: \`${session.record.codexThreadId}\``,
+      `Workspace: \`${workspace.root}\``,
+    ].join("\n"),
+  );
+  await message.pin("Oak session info");
 }
 
 async function markSessionStreamingState(
@@ -1251,6 +1302,40 @@ async function setSessionCodexOutputKind(
     updatedAt: new Date().toISOString(),
   };
   await persistSession(session);
+}
+
+async function commitSessionFinalAnswer(
+  session: SessionContext,
+  text: string,
+): Promise<void> {
+  resetCommentaryState(session);
+  setTyping(session, false);
+  session.record = {
+    ...session.record,
+    activeTurnId: null,
+    streamingActive: false,
+    lastAssistantResponse: text,
+    lastCodexOutputKind: "final_answer",
+    updatedAt: new Date().toISOString(),
+  };
+  await persistSession(session);
+  await sendFinalAnswer(session, text);
+}
+
+async function promoteCommentaryToFinalAnswer(
+  session: SessionContext,
+): Promise<boolean> {
+  if (session.record.lastCodexOutputKind === "final_answer") {
+    return false;
+  }
+
+  const fallbackText = session.lastCommentaryText.trim();
+  if (!fallbackText) {
+    return false;
+  }
+
+  await commitSessionFinalAnswer(session, fallbackText);
+  return true;
 }
 
 async function getFileSize(filePath: string | null): Promise<number> {
@@ -1550,12 +1635,22 @@ async function resumeSessionAfterCodexRestart(
       attachSessionEventBridge(session);
       await ensureSessionReady(session);
 
+      session.rolloutReadOffset = session.record.rolloutReadOffset;
+      session.rolloutLineRemainder = "";
+      await pollRolloutFile(session);
+
+      if (
+        !sessionHasActiveStreaming(session) &&
+        session.record.lastCodexOutputKind === "final_answer"
+      ) {
+        await setSessionPendingRestartContinue(session, false);
+        session.restartResumeAttempt = 0;
+        return;
+      }
+
       if (sessionHasActiveStreaming(session)) {
-        session.rolloutReadOffset = session.record.rolloutReadOffset;
-        session.rolloutLineRemainder = "";
         setTyping(session, true);
         startRolloutPolling(session);
-        await pollRolloutFile(session);
         await setSessionPendingRestartContinue(session, false);
         session.restartResumeAttempt = 0;
         return;
@@ -1619,6 +1714,7 @@ async function handleSessionEvent(
   switch (event.type) {
     case "turn_started":
       session.streamedOutputKeys.clear();
+      session.interruptingTurnId = null;
       resetCommentaryState(session, event.turnId);
       cancelSessionRestartResume(session);
       await markSessionStreamingState(session, {
@@ -1632,6 +1728,11 @@ async function handleSessionEvent(
       return;
     case "thread_status_changed":
       if (event.status === "idle") {
+        if (session.interruptingTurnId) {
+          session.interruptingTurnId = null;
+        } else {
+          await promoteCommentaryToFinalAnswer(session);
+        }
         setTyping(session, false);
         resetCommentaryState(session);
         cancelSessionReconnect(session);
@@ -1645,6 +1746,9 @@ async function handleSessionEvent(
       }
       return;
     case "reasoning":
+      if (isSuppressedInterruptedTurn(session, event.turnId)) {
+        return;
+      }
       await setSessionCodexOutputKind(session, "reasoning");
       {
         const eventKey = buildStreamedOutputKey([
@@ -1662,6 +1766,9 @@ async function handleSessionEvent(
       await sendCompactText(session.thread, event.text);
       return;
     case "command_execution":
+      if (isSuppressedInterruptedTurn(session, event.turnId)) {
+        return;
+      }
       await setSessionCodexOutputKind(session, "command_execution");
       {
         const eventKey = buildStreamedOutputKey([
@@ -1679,6 +1786,9 @@ async function handleSessionEvent(
       await sendCompactCommand(session.thread, event.command);
       return;
     case "assistant_message":
+      if (isSuppressedInterruptedTurn(session, event.turnId)) {
+        return;
+      }
       if (event.phase === "commentary") {
         await setSessionCodexOutputKind(session, "commentary");
         if (session.lastCommentaryTurnId !== event.turnId) {
@@ -1715,18 +1825,12 @@ async function handleSessionEvent(
       }
 
       resetCommentaryState(session);
-      setTyping(session, false);
-      session.record = {
-        ...session.record,
-        lastAssistantResponse: event.text,
-        lastCodexOutputKind: "final_answer",
-        updatedAt: new Date().toISOString(),
-      };
-      await persistSession(session);
-      await sendFinalAnswer(session, event.text);
+      await commitSessionFinalAnswer(session, event.text);
+      session.client.markTurnCompleted(event.turnId);
       return;
     case "turn_aborted":
       session.streamedOutputKeys.clear();
+      session.interruptingTurnId = null;
       setTyping(session, false);
       resetCommentaryState(session);
       cancelSessionReconnect(session);
@@ -1741,6 +1845,11 @@ async function handleSessionEvent(
       return;
     case "turn_completed":
       session.streamedOutputKeys.clear();
+      if (isSuppressedInterruptedTurn(session, event.turnId)) {
+        session.interruptingTurnId = null;
+      } else {
+        await promoteCommentaryToFinalAnswer(session);
+      }
       setTyping(session, false);
       resetCommentaryState(session);
       cancelSessionReconnect(session);
@@ -1867,25 +1976,31 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
       continue;
     }
 
+    // The rollout file mirrors live app-server output. Replaying commentary,
+    // reasoning, or commands from here causes Discord duplicates when the
+    // websocket path is healthy, so keep rollout polling limited to recovery
+    // state such as agent tracking and turn completion/abort markers.
     if (
       entry.type === "event_msg" &&
       payload.type === "agent_message" &&
       typeof payload.message === "string"
     ) {
-      const phase =
-        payload.phase === "commentary" || payload.phase === "final_answer"
-          ? payload.phase
-          : "unknown";
-      if (phase !== "commentary") {
-        continue;
+      if (
+        sessionNeedsRolloutRecovery(session) &&
+        payload.phase === "final_answer"
+      ) {
+        const turnId =
+          typeof payload.turn_id === "string" && payload.turn_id.trim()
+            ? payload.turn_id
+            : session.record.activeTurnId ?? "unknown";
+        await handleSessionEvent(session, {
+          type: "assistant_message",
+          threadId: session.record.codexThreadId,
+          turnId,
+          text: payload.message,
+          phase: "final_answer",
+        });
       }
-      await handleSessionEvent(session, {
-        type: "assistant_message",
-        threadId: session.record.codexThreadId,
-        turnId: session.client.currentTurnId ?? "unknown",
-        text: payload.message,
-        phase,
-      });
       continue;
     }
 
@@ -1952,31 +2067,11 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
     }
 
     if (entry.type === "response_item" && payload.type === "reasoning") {
-      const reasoningText = extractReasoningTextFromRollout(payload);
-      if (reasoningText) {
-        await handleSessionEvent(session, {
-          type: "reasoning",
-          threadId: session.record.codexThreadId,
-          turnId: session.client.currentTurnId ?? "unknown",
-          text: reasoningText,
-        });
-      }
       continue;
     }
 
     if (entry.type === "response_item") {
       const commands = extractExecCommandsFromRolloutPayload(payload);
-      for (const command of commands) {
-        await handleSessionEvent(session, {
-          type: "command_execution",
-          threadId: session.record.codexThreadId,
-          turnId:
-            session.client.currentTurnId ??
-            session.record.activeTurnId ??
-            "unknown",
-          command,
-        });
-      }
       if (commands.length > 0) {
         continue;
       }
@@ -1996,7 +2091,19 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
     }
 
     if (entry.type === "event_msg" && payload.type === "task_complete") {
-      session.client.markTurnCompleted(session.record.activeTurnId);
+      const turnId =
+        typeof payload.turn_id === "string" && payload.turn_id.trim()
+          ? payload.turn_id
+          : session.record.activeTurnId;
+      if (sessionNeedsRolloutRecovery(session)) {
+        await handleSessionEvent(session, {
+          type: "turn_completed",
+          threadId: session.record.codexThreadId,
+          turnId,
+        });
+        continue;
+      }
+      session.client.markTurnCompleted(turnId);
     }
   }
 }
@@ -2101,7 +2208,34 @@ async function ensureSessionReady(session: SessionContext): Promise<void> {
   await session.client.ensureConnected();
 
   if (session.record.codexThreadId) {
-    await session.client.resumeThread(session.record.codexThreadId);
+    try {
+      await session.client.resumeThread(session.record.codexThreadId);
+    } catch (error) {
+      if (
+        !sessionHasPendingRestartContinue(session) ||
+        !isMissingCodexRolloutResumeError(error)
+      ) {
+        throw error;
+      }
+
+      const previousThreadId = session.record.codexThreadId;
+      const codexThreadId = await session.client.startThread(session.thread.name);
+      session.record = {
+        ...session.record,
+        codexThreadId,
+        codexRolloutPath: null,
+        activeTurnId: null,
+        streamingActive: false,
+        rolloutReadOffset: 0,
+        updatedAt: new Date().toISOString(),
+      };
+      await persistSession(session);
+      await sendCompactText(
+        session.thread,
+        `Codex could not resume thread \`${previousThreadId}\` after restart because no rollout was available. Oak started a fresh Codex thread and will continue there.`,
+      );
+      await sendSessionThreadInfoMessage(session);
+    }
   } else {
     const codexThreadId = await session.client.startThread(session.thread.name);
     session.record = {
@@ -2110,6 +2244,7 @@ async function ensureSessionReady(session: SessionContext): Promise<void> {
       updatedAt: new Date().toISOString(),
     };
     await persistSession(session);
+    await sendSessionThreadInfoMessage(session);
   }
 
   await syncThreadMetadata(session);
@@ -2143,6 +2278,7 @@ function buildSessionContext(
     restartResumeAttempt: 0,
     rolloutReadOffset: record.rolloutReadOffset,
     rolloutLineRemainder: "",
+    interruptingTurnId: null,
     lastReportedErrorText: null,
     lastReportedErrorAt: 0,
   };
@@ -2198,6 +2334,7 @@ async function getOrCreateSession(
     restartResumeAttempt: 0,
     rolloutReadOffset: record.rolloutReadOffset,
     rolloutLineRemainder: "",
+    interruptingTurnId: null,
     lastReportedErrorText: null,
     lastReportedErrorAt: 0,
   };
@@ -3141,6 +3278,7 @@ async function handleRateLimitsCommand(
 
   const summary = await getOakRateLimitSummary({
     cwd: oakConfig.repoRoot,
+    excludeProfileNames: ["codex"],
   });
   await message.reply(buildOakRateLimitContainer(summary));
   return true;
@@ -3168,7 +3306,9 @@ async function handleInterruptCommand(
   if (session.client.isWorking || sessionHasActiveStreaming(session)) {
     try {
       await ensureSessionReady(session);
-      await session.client.interruptTurn();
+      const interruptedTurnId = await session.client.interruptTurn();
+      session.interruptingTurnId = interruptedTurnId;
+      setTyping(session, false);
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -3230,25 +3370,9 @@ async function handleCodexSwitchInteraction(
 
   let statusText: string;
   try {
-    const result = await switchCodexProfile(selectedProfile);
-    const statusLines: string[] = [];
-    if (result.previousProfilePath) {
-      statusLines.push(
-        `Saved the outgoing live auth for \`${result.previousProfile}\` to \`${result.previousProfilePath}\`.`,
-      );
-    } else if (!result.previousProfile) {
-      statusLines.push(
-        "No active Codex profile was detected before this switch, so there was no previous profile auth to save.",
-      );
-    } else if (!result.previousProfileHadLiveAuth) {
-      statusLines.push(
-        `Active Codex profile was \`${result.previousProfile}\`, but \`~/.codex/auth.json\` was missing so there was no live auth to save back first.`,
-      );
-    }
-    statusLines.push(`Switched Codex profile to \`${selectedProfile}\`.`);
-    statusLines.push(
-      `\`${result.sourcePath}\` -> \`${result.destinationPath}\``,
-    );
+    const statusLines = [await switchCodexProfileWithStatus(selectedProfile)];
+    await restartCodex();
+    statusLines.push("Requested a Codex app-server restart.");
     statusText = statusLines.join("\n");
   } catch (error) {
     statusText = error instanceof Error ? error.message : String(error);

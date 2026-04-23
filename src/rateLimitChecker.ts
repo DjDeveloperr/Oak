@@ -53,6 +53,7 @@ interface OakRateLimitCheckerOptions {
   codexBin?: string;
   cwd?: string;
   timeoutMs?: number;
+  excludeProfileNames?: string[];
 }
 
 function formatEpoch(msOrSec: number | null | undefined): string {
@@ -190,7 +191,13 @@ function getPickScore(result: OakRateLimitCheckResult): number {
 
 function pickBestResult(
   results: OakRateLimitCheckResult[],
+  excludeProfileNames?: Iterable<string>,
 ): OakRateLimitCheckResult | null {
+  const excludedProfiles = new Set(
+    [...(excludeProfileNames ?? [])]
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0),
+  );
   const ranked = results
     .map((result) => ({
       result,
@@ -201,6 +208,7 @@ function pickBestResult(
       ),
       score: getPickScore(result),
     }))
+    .filter((entry) => !excludedProfiles.has(entry.profileName))
     .filter((entry) => Number.isFinite(entry.score));
 
   if (ranked.length === 0) {
@@ -431,13 +439,14 @@ export async function getOakRateLimitSummary(
       typeof options?.timeoutMs === "number" && options.timeoutMs > 0
         ? options.timeoutMs
         : 15000,
+    excludeProfileNames: options?.excludeProfileNames ?? [],
   };
 
   const results = await Promise.all(
     homes.map((home) => runForHome(home, resolvedOptions)),
   );
 
-  const best = pickBestResult(results);
+  const best = pickBestResult(results, options?.excludeProfileNames);
   return {
     profiles: results.map((result) => ({
       profileName: path.basename(result.home) || result.home,

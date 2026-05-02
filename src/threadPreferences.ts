@@ -8,7 +8,7 @@ import {
 } from "discord.js";
 
 export const DEFAULT_OAK_MODEL = "gpt-5.5";
-export const DEFAULT_OAK_REASONING_EFFORT = "high";
+export const DEFAULT_OAK_REASONING_EFFORT = "medium";
 export const OAK_FAST_MODE_MODEL = "gpt-5.4-mini";
 export const OAK_FAST_MODE_REASONING_EFFORT = "low";
 
@@ -78,7 +78,7 @@ const STATIC_MODEL_OPTIONS: readonly OakModelOption[] = [
     value: "gpt-5.5",
     label: "GPT-5.5",
     description: "Frontier model for complex coding and long-running work.",
-    defaultReasoningEffort: "high",
+    defaultReasoningEffort: "medium",
     supportedReasoningEfforts: STATIC_REASONING_OPTIONS,
     isDefault: true,
   },

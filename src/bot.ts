@@ -88,6 +88,7 @@ interface SessionContext {
   streamedOutputKeys: Set<string>;
   lastCommentaryTurnId: string | null;
   lastCommentaryText: string;
+  lastCommentaryMessageIds: string[];
   typingTimer: NodeJS.Timeout | null;
   rolloutPoller: NodeJS.Timeout | null;
   reconnectTimer: NodeJS.Timeout | null;
@@ -418,6 +419,7 @@ function resetCommentaryState(
 ): void {
   session.lastCommentaryTurnId = turnId;
   session.lastCommentaryText = "";
+  session.lastCommentaryMessageIds = [];
 }
 
 function extractCommentaryDelta(
@@ -843,14 +845,16 @@ async function sendSmallText(
 async function sendCompactText(
   target: ThreadChannel,
   text: string,
-): Promise<void> {
+): Promise<Message[]> {
   const normalizedText = rewriteDiscordFileReferences(text);
+  const messages: Message[] = [];
   for (const chunk of splitDiscordText(
     formatCompactBlock(normalizedText),
     1900,
   )) {
-    await target.send(chunk);
+    messages.push(await target.send(chunk));
   }
+  return messages;
 }
 
 async function sendCompactCommand(
@@ -1308,6 +1312,19 @@ async function commitSessionFinalAnswer(
   session: SessionContext,
   text: string,
 ): Promise<void> {
+  const shouldReplacePostedCommentary =
+    session.record.lastCodexOutputKind === "commentary" &&
+    session.lastCommentaryMessageIds.length > 0 &&
+    session.lastCommentaryText.trim() === text.trim();
+
+  if (shouldReplacePostedCommentary) {
+    await Promise.allSettled(
+      session.lastCommentaryMessageIds.map((messageId) =>
+        session.thread.messages.delete(messageId),
+      ),
+    );
+  }
+
   resetCommentaryState(session);
   setTyping(session, false);
   session.record = {
@@ -1805,7 +1822,10 @@ async function handleSessionEvent(
           return;
         }
 
-        await sendCompactText(session.thread, delta);
+        const messages = await sendCompactText(session.thread, delta);
+        session.lastCommentaryMessageIds.push(
+          ...messages.map((message) => message.id),
+        );
         return;
       }
 
@@ -2268,6 +2288,7 @@ function buildSessionContext(
     streamedOutputKeys: new Set<string>(),
     lastCommentaryTurnId: null,
     lastCommentaryText: "",
+    lastCommentaryMessageIds: [],
     typingTimer: null,
     rolloutPoller: null,
     reconnectTimer: null,
@@ -2324,6 +2345,7 @@ async function getOrCreateSession(
     streamedOutputKeys: new Set<string>(),
     lastCommentaryTurnId: null,
     lastCommentaryText: "",
+    lastCommentaryMessageIds: [],
     typingTimer: null,
     rolloutPoller: null,
     reconnectTimer: null,

@@ -81,6 +81,7 @@ Start a session:
 - In an Oak thread, send a normal message to continue the session
 - In an uninitialized thread, mention the bot once to start session state
 - DM Oak as the configured `OAK_OWNER_ID` user to use the owner-only admin Superagent rooted at `~/.oak`
+- Superagents can schedule cron jobs through the local Oak API. Jobs send their stored message back into the same workspace or owner DM Superagent when they fire.
 
 Mention commands:
 
@@ -132,5 +133,6 @@ The local automation CLI is available after build:
 ```bash
 oak-api thread --workspace <key> --prompt "Do the task" --subscribe
 oak-api thread --workspace <key> --prompt "Do the task" --subscribe --subscribe-workspace oak-admin
+oak-api cron add --workspace <key> --expression "0 9 * * 1-5" --message "Review open work"
 oak-api wait <discord-thread-id>
 ```

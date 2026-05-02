@@ -21,6 +21,7 @@ node dist/src/oakCli.js <command>
 - A Superagent is one long-lived session per workspace. Messages prefixed with `--` in a routed Discord channel are sent to that workspace's Superagent. If it does not exist, Oak creates it.
 - The owner can DM Oak directly to use an owner-only admin Superagent rooted at `~/.oak`.
 - A subscription asks Oak to notify the workspace Superagent when a target session completes. If the Superagent is working, Oak steers the update into its active turn. Otherwise Oak starts a new Superagent turn with the update.
+- A cron job belongs to one Superagent workspace. When it fires, Oak sends the stored message into that same Superagent, steering if the Superagent is already working.
 
 ## CLI
 
@@ -61,6 +62,19 @@ The owner-only DM Superagent is addressed as workspace `oak-admin`:
 ```bash
 oak-api superagent oak-admin "List the guilds Oak is in"
 ```
+
+Schedule a message into a Superagent with a five-field cron expression:
+
+```bash
+oak-api cron add --workspace <workspace-key> --expression "0 9 * * 1-5" --message "Review open subscribed work"
+oak-api cron add --workspace oak-admin --expression "*/30 * * * *" --message "Check Oak health"
+oak-api cron list --workspace <workspace-key>
+oak-api cron disable <cron-job-id>
+oak-api cron enable <cron-job-id>
+oak-api cron remove <cron-job-id>
+```
+
+Cron expressions use the bot process timezone and support numbers, `*`, lists, ranges, and steps.
 
 Subscribe the workspace Superagent to a spawned thread:
 
@@ -130,7 +144,7 @@ Returns configured workspaces.
 
 `GET /config`
 
-Returns the full Oak configuration snapshot: workspaces, routes, Superagents, and serialized sessions.
+Returns the full Oak configuration snapshot: workspaces, routes, Superagents, cron jobs, and serialized sessions.
 
 `POST /config/workspaces`
 
@@ -212,6 +226,46 @@ Body:
 
 Returns persisted Oak sessions.
 
+`GET /cron-jobs`
+
+Returns persisted Superagent cron jobs. Add `?workspace=<workspace-key>` to filter.
+
+`POST /cron-jobs`
+
+Creates or updates a cron job for a Superagent workspace. `oak-admin` is accepted for the owner-only DM Superagent.
+
+Body:
+
+```json
+{
+  "id": "Optional stable id; generated when omitted",
+  "workspace": "default",
+  "expression": "0 9 * * 1-5",
+  "message": "Review open subscribed work",
+  "enabled": true
+}
+```
+
+`POST /cron-jobs/enabled`
+
+Enables or disables a cron job.
+
+Body:
+
+```json
+{ "id": "cron-job-id", "enabled": false }
+```
+
+`POST /cron-jobs/remove`
+
+Removes a cron job.
+
+Body:
+
+```json
+{ "id": "cron-job-id" }
+```
+
 `POST /threads`
 
 Creates a new Discord thread in a workspace route and creates/resumes the Codex thread for it.
@@ -267,6 +321,21 @@ Body:
 
 ```json
 { "message": "Coordination prompt" }
+```
+
+`POST /superagents/:workspace/cron-jobs`
+
+Creates or updates a cron job scoped to the addressed Superagent. This is the preferred endpoint for Superagents scheduling their own work.
+
+Body:
+
+```json
+{
+  "id": "Optional stable id; generated when omitted",
+  "expression": "*/15 * * * *",
+  "message": "Scheduled prompt text",
+  "enabled": true
+}
 ```
 
 `POST /subscriptions`

@@ -13,6 +13,11 @@ function usage(): never {
       "  oak-api thread --workspace <key> --prompt <text> [--name <name>] [--channel <id>] [--subscribe] [--subscribe-workspace <key>]",
       "  oak-api message <discordThreadId> <text>",
       "  oak-api superagent <workspace> <text>",
+      "  oak-api cron list [--workspace <key>]",
+      "  oak-api cron add --workspace <key> --expression <cron> --message <text> [--id <id>]",
+      "  oak-api cron remove <id>",
+      "  oak-api cron enable <id>",
+      "  oak-api cron disable <id>",
       "  oak-api subscribe <workspace> (--discord-thread <id> | --codex-thread <id>)",
       "  oak-api wait <discordThreadId> [--timeout-ms <ms>] [--interval-ms <ms>]",
       "  oak-api context <discordThreadId>",
@@ -161,6 +166,63 @@ async function main(): Promise<void> {
       body: JSON.stringify({ message: textParts.join(" ") }),
     });
     return;
+  }
+
+  if (command === "cron") {
+    const subcommand = args.shift();
+    if (subcommand === "list") {
+      const workspace = readFlag(args, "--workspace");
+      if (args.length > 0) {
+        usage();
+      }
+      await request(
+        workspace
+          ? `/cron-jobs?workspace=${encodeURIComponent(workspace)}`
+          : "/cron-jobs",
+      );
+      return;
+    }
+
+    if (subcommand === "add") {
+      const workspace = readFlag(args, "--workspace");
+      const expression = readFlag(args, "--expression");
+      const message = readFlag(args, "--message");
+      const id = readFlag(args, "--id");
+      if (!workspace || !expression || !message || args.length > 0) {
+        usage();
+      }
+      await request(`/superagents/${encodeURIComponent(workspace)}/cron-jobs`, {
+        method: "POST",
+        body: JSON.stringify({ id, expression, message }),
+      });
+      return;
+    }
+
+    if (subcommand === "remove") {
+      const [id] = args;
+      if (!id || args.length !== 1) {
+        usage();
+      }
+      await request("/cron-jobs/remove", {
+        method: "POST",
+        body: JSON.stringify({ id }),
+      });
+      return;
+    }
+
+    if (subcommand === "enable" || subcommand === "disable") {
+      const [id] = args;
+      if (!id || args.length !== 1) {
+        usage();
+      }
+      await request("/cron-jobs/enabled", {
+        method: "POST",
+        body: JSON.stringify({ id, enabled: subcommand === "enable" }),
+      });
+      return;
+    }
+
+    usage();
   }
 
   if (command === "subscribe") {

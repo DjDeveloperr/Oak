@@ -98,6 +98,7 @@ const OAK_MODEL_OPTIONS_CACHE_TTL_MS = 5 * 60 * 1000;
 const OAK_RECOVERY_MAX_ELAPSED_MS = 5 * 60 * 1000;
 const OAK_ADMIN_WORKSPACE_KEY = "oak-admin";
 const OAK_SUPERAGENT_THREAD_NAME_PREFIX = "Oak Superagent";
+const MAX_TIMEOUT_MS = 2_147_483_647;
 const execFileAsync = promisify(execFile);
 
 type OakSessionChannel = ThreadChannel | DMChannel;
@@ -149,6 +150,8 @@ let oakModelOptionsCache: {
   expiresAt: number;
   data: OakModelOption[];
 } | null = null;
+const cronJobTimers = new Map<string, NodeJS.Timeout>();
+const runningCronJobs = new Set<string>();
 
 function log(message: string, context?: Record<string, unknown>): void {
   if (context) {
@@ -173,11 +176,27 @@ function getOakAdminWorkspace(): OakWorkspaceConfig {
   };
 }
 
-function getSuperagentWorkspace(workspaceKey: string): OakWorkspaceConfig | null {
+function getSuperagentWorkspace(
+  workspaceKey: string,
+): OakWorkspaceConfig | null {
   if (workspaceKey === OAK_ADMIN_WORKSPACE_KEY) {
     return getOakAdminWorkspace();
   }
   return oakAccessConfigStore.getWorkspace(workspaceKey);
+}
+
+async function getOrCreateSuperagentSessionForWorkspaceKey(
+  discordClient: Client,
+  workspaceKey: string,
+): Promise<SessionContext> {
+  const workspace = getSuperagentWorkspace(workspaceKey);
+  if (!workspace) {
+    throw new Error(`Unknown workspace: ${workspaceKey}`);
+  }
+  if (workspace.key === OAK_ADMIN_WORKSPACE_KEY) {
+    return await getOrCreateAdminDmSuperagentSession(discordClient);
+  }
+  return await getOrCreateSuperagentSession(discordClient, workspace, null);
 }
 
 function getSessionChannelName(channel: OakSessionChannel): string {
@@ -1494,7 +1513,9 @@ async function setSessionCompactionStatus(
   await persistSession(session);
 }
 
-async function requestSessionCompaction(session: SessionContext): Promise<void> {
+async function requestSessionCompaction(
+  session: SessionContext,
+): Promise<void> {
   if (session.client.isWorking || sessionHasActiveStreaming(session)) {
     throw new Error("Cannot compact context while a Codex turn is running.");
   }
@@ -3263,6 +3284,76 @@ async function getOrCreateAdminDmSuperagentSession(
     null,
   );
   return session;
+}
+
+function clearCronJobTimer(id: string): void {
+  const timer = cronJobTimers.get(id);
+  if (timer) {
+    clearTimeout(timer);
+    cronJobTimers.delete(id);
+  }
+}
+
+function scheduleCronJobTimer(discordClient: Client, id: string): void {
+  clearCronJobTimer(id);
+  const job = superagentStore.getCronJob(id);
+  if (!job || !job.enabled) {
+    return;
+  }
+
+  const delayMs = Math.max(0, Date.parse(job.nextRunAt) - Date.now());
+  const timer = setTimeout(
+    () => {
+      cronJobTimers.delete(id);
+      if (delayMs > MAX_TIMEOUT_MS) {
+        scheduleCronJobTimer(discordClient, id);
+        return;
+      }
+      void triggerCronJob(discordClient, id).catch((error) => {
+        console.error("[oak] Superagent cron job failed:", { id, error });
+        scheduleCronJobTimer(discordClient, id);
+      });
+    },
+    Math.min(delayMs, MAX_TIMEOUT_MS),
+  );
+  timer.unref();
+  cronJobTimers.set(id, timer);
+}
+
+function scheduleAllCronJobs(discordClient: Client): void {
+  for (const id of cronJobTimers.keys()) {
+    clearCronJobTimer(id);
+  }
+  for (const job of superagentStore.listCronJobs()) {
+    scheduleCronJobTimer(discordClient, job.id);
+  }
+}
+
+async function triggerCronJob(
+  discordClient: Client,
+  id: string,
+): Promise<void> {
+  if (runningCronJobs.has(id)) {
+    return;
+  }
+  runningCronJobs.add(id);
+  const triggeredAt = new Date();
+  try {
+    const job = superagentStore.getCronJob(id);
+    if (!job || !job.enabled) {
+      return;
+    }
+
+    await superagentStore.markCronJobTriggered(id, triggeredAt);
+    const session = await getOrCreateSuperagentSessionForWorkspaceKey(
+      discordClient,
+      job.workspaceKey,
+    );
+    await dispatchTextToSession(session, job.message, null);
+  } finally {
+    runningCronJobs.delete(id);
+    scheduleCronJobTimer(discordClient, id);
+  }
 }
 
 function buildResumeThreadName(sourceRecord: SessionRecord): string {
@@ -5095,7 +5186,10 @@ async function handleMessage(
       return;
     }
     const prompt =
-      message.content.trimStart().replace(/^--\s*/, "").trim() || "(no text)";
+      message.content
+        .trimStart()
+        .replace(/^--\s*/, "")
+        .trim() || "(no text)";
     await dispatchTextToSession(session, prompt, message.author.id);
     await message.react("👍").catch(() => {});
     return;
@@ -5238,8 +5332,10 @@ async function handleRawDmMessage(
   }
 
   const prompt =
-    (data.content ?? "").trimStart().replace(/^--\s*/, "").trim() ||
-    "(no text)";
+    (data.content ?? "")
+      .trimStart()
+      .replace(/^--\s*/, "")
+      .trim() || "(no text)";
   await dispatchTextToSession(session, prompt, userId);
 }
 
@@ -5294,12 +5390,35 @@ function optionalBooleanField(body: unknown, field: string): boolean {
   );
 }
 
+function optionalBooleanValue(
+  body: unknown,
+  field: string,
+): boolean | undefined {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    typeof (body as Record<string, unknown>)[field] === "boolean"
+  ) {
+    return (body as Record<string, unknown>)[field] as boolean;
+  }
+  return undefined;
+}
+
+function requireBooleanField(body: unknown, field: string): boolean {
+  const value = optionalBooleanValue(body, field);
+  if (typeof value === "boolean") {
+    return value;
+  }
+  throw new Error(`Missing required boolean field: ${field}`);
+}
+
 function getOakConfigSnapshot() {
   return {
     adminWorkspace: getOakAdminWorkspace(),
     workspaces: oakAccessConfigStore.listWorkspaces(),
     routes: oakAccessConfigStore.listRoutes(),
     superagents: superagentStore.listSuperagents(),
+    cronJobs: superagentStore.listCronJobs(),
     sessions: sessionStore.list().map(serializeSession),
   };
 }
@@ -5316,9 +5435,10 @@ async function runDiscordAdminScript(
   discordClient: Client,
   code: string,
 ): Promise<string> {
-  const AsyncFunction = Object.getPrototypeOf(
-    async function () {},
-  ).constructor as new (...args: string[]) => (
+  const AsyncFunction = Object.getPrototypeOf(async function () {})
+    .constructor as new (
+    ...args: string[]
+  ) => (
     client: Client,
     discord: typeof import("discord.js"),
     oak: Record<string, unknown>,
@@ -5437,8 +5557,9 @@ async function createApiThread(
     reason: "Oak local API thread",
   });
   const session = await createFreshSession(thread);
-  let subscription: Awaited<ReturnType<OakSuperagentStore["subscribe"]>> | null =
-    null;
+  let subscription: Awaited<
+    ReturnType<OakSuperagentStore["subscribe"]>
+  > | null = null;
   if (superagent) {
     subscription = await superagentStore.subscribe({
       workspaceKey: subscriptionWorkspace?.key ?? workspace.key,
@@ -5578,9 +5699,57 @@ async function handleOakApiRequest(
     return;
   }
 
+  if (method === "GET" && url.pathname === "/cron-jobs") {
+    writeJsonResponse(response, 200, {
+      cronJobs: superagentStore.listCronJobs(url.searchParams.get("workspace")),
+    });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/cron-jobs") {
+    const body = await readRequestJson(request);
+    const workspaceKey = requireStringField(body, "workspace");
+    if (!getSuperagentWorkspace(workspaceKey)) {
+      throw new Error(`Unknown workspace: ${workspaceKey}`);
+    }
+    const cronJob = await superagentStore.upsertCronJob({
+      id: optionalStringField(body, "id"),
+      workspaceKey,
+      expression: requireStringField(body, "expression"),
+      message: requireStringField(body, "message"),
+      enabled: optionalBooleanValue(body, "enabled"),
+    });
+    scheduleCronJobTimer(discordClient, cronJob.id);
+    writeJsonResponse(response, 200, { cronJob });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/cron-jobs/remove") {
+    const body = await readRequestJson(request);
+    const id = requireStringField(body, "id");
+    clearCronJobTimer(id);
+    const removed = await superagentStore.removeCronJob(id);
+    writeJsonResponse(response, 200, { removed });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/cron-jobs/enabled") {
+    const body = await readRequestJson(request);
+    const cronJob = await superagentStore.setCronJobEnabled(
+      requireStringField(body, "id"),
+      requireBooleanField(body, "enabled"),
+    );
+    scheduleCronJobTimer(discordClient, cronJob.id);
+    writeJsonResponse(response, 200, { cronJob });
+    return;
+  }
+
   if (method === "POST" && url.pathname === "/threads") {
     const body = await readRequestJson(request);
-    const { session, subscription } = await createApiThread(discordClient, body);
+    const { session, subscription } = await createApiThread(
+      discordClient,
+      body,
+    );
     writeJsonResponse(response, 200, {
       session: serializeSession(session),
       subscription,
@@ -5643,23 +5812,36 @@ async function handleOakApiRequest(
     method === "POST" &&
     parts[0] === "superagents" &&
     parts[1] &&
+    parts[2] === "cron-jobs"
+  ) {
+    const workspace = getSuperagentWorkspace(parts[1]);
+    if (!workspace) {
+      throw new Error(`Unknown workspace: ${parts[1]}`);
+    }
+    const body = await readRequestJson(request);
+    const cronJob = await superagentStore.upsertCronJob({
+      id: optionalStringField(body, "id"),
+      workspaceKey: workspace.key,
+      expression: requireStringField(body, "expression"),
+      message: requireStringField(body, "message"),
+      enabled: optionalBooleanValue(body, "enabled"),
+    });
+    scheduleCronJobTimer(discordClient, cronJob.id);
+    writeJsonResponse(response, 200, { cronJob });
+    return;
+  }
+
+  if (
+    method === "POST" &&
+    parts[0] === "superagents" &&
+    parts[1] &&
     parts[2] === "message"
   ) {
     const body = await readRequestJson(request);
-    const session =
-      parts[1] === OAK_ADMIN_WORKSPACE_KEY
-        ? await getOrCreateAdminDmSuperagentSession(discordClient)
-        : await (async () => {
-            const workspace = oakAccessConfigStore.getWorkspace(parts[1] ?? "");
-            if (!workspace) {
-              throw new Error(`Unknown workspace: ${parts[1]}`);
-            }
-            return await getOrCreateSuperagentSession(
-              discordClient,
-              workspace,
-              null,
-            );
-          })();
+    const session = await getOrCreateSuperagentSessionForWorkspaceKey(
+      discordClient,
+      parts[1],
+    );
     const dispatch = await dispatchTextToSession(
       session,
       requireStringField(body, "message"),
@@ -5789,6 +5971,8 @@ export async function main(): Promise<void> {
     void recoverInterruptedSessionsOnStartup(readyClient).catch((error) => {
       console.error("[oak] Interrupted session recovery failed:", error);
     });
+
+    scheduleAllCronJobs(readyClient);
   });
 
   client.on(Events.GuildCreate, (guild) => {
@@ -5839,11 +6023,12 @@ export async function main(): Promise<void> {
         channelId: data.channel_id ?? null,
         type: data.type ?? null,
       });
-      void handleRawDmMessage(client, packet.d as Parameters<typeof handleRawDmMessage>[1]).catch(
-        (error) => {
-          console.error("[oak] Raw DM handler failed:", error);
-        },
-      );
+      void handleRawDmMessage(
+        client,
+        packet.d as Parameters<typeof handleRawDmMessage>[1],
+      ).catch((error) => {
+        console.error("[oak] Raw DM handler failed:", error);
+      });
     }
   });
 

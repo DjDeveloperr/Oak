@@ -118,6 +118,7 @@ export const oakConfig = {
   attachmentsDir: path.join(runtimeDir, "attachments"),
   sessionsPath: path.join(runtimeDir, "sessions.json"),
   configPath: path.join(runtimeDir, "config.json"),
+  superagentsPath: path.join(runtimeDir, "superagents.json"),
   discordToken: (process.env.OAK_DISCORD_TOKEN ?? "").trim(),
   ownerUserId: (process.env.OAK_OWNER_ID ?? "").trim(),
   codexBin: (
@@ -138,6 +139,8 @@ export const oakConfig = {
   serviceTier: (process.env.OAK_CODEX_SERVICE_TIER ?? "").trim() || "fast",
   turnTimeoutMs: parseInteger(process.env.OAK_TURN_TIMEOUT_MS, 60 * 60 * 1000),
   typingIntervalMs: parseInteger(process.env.OAK_TYPING_INTERVAL_MS, 8000),
+  apiHost: (process.env.OAK_API_HOST ?? "127.0.0.1").trim(),
+  apiPort: parseInteger(process.env.OAK_API_PORT, 4788),
   dryRun: process.env.OAK_DRY_RUN === "1",
 };
 

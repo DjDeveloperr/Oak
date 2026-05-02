@@ -6,6 +6,7 @@ import {
   GatewayIntentBits,
   MessageType,
   MessageFlags,
+  Partials,
   SeparatorBuilder,
   TextDisplayBuilder,
   ThreadAutoArchiveDuration,
@@ -18,16 +19,31 @@ import {
   type MessageReplyOptions,
   type StringSelectMenuInteraction,
   type TextChannel,
+  type DMChannel,
   type ThreadChannel,
 } from "discord.js";
 import { execFile } from "node:child_process";
-import { mkdir, open, readdir, stat, writeFile } from "node:fs/promises";
-import { promisify } from "node:util";
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import {
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { inspect, promisify } from "node:util";
+import os from "node:os";
 import path from "node:path";
 import {
   OakCodexClient,
   type OakCodexEvent,
   type OakCodexModelOption,
+  type OakTokenUsage,
   type OakUserInput,
 } from "./codexClient.js";
 import {
@@ -60,8 +76,10 @@ import {
 import {
   SessionStore,
   type OakTrackedAgentRecord,
+  type OakTokenUsageRecord,
   type SessionRecord,
 } from "./sessionStore.js";
+import { OakSuperagentStore } from "./superagentStore.js";
 import {
   buildOakFastModePreferences,
   buildOakThreadPreferences,
@@ -77,11 +95,16 @@ const DISCORD_MESSAGE_LIMIT = 2000;
 const DISCORD_INLINE_COMMAND_LIMIT = 500;
 const DISCORD_CODE_BLOCK_LIMIT = 1900;
 const OAK_MODEL_OPTIONS_CACHE_TTL_MS = 5 * 60 * 1000;
+const OAK_RECOVERY_MAX_ELAPSED_MS = 5 * 60 * 1000;
+const OAK_ADMIN_WORKSPACE_KEY = "oak-admin";
+const OAK_SUPERAGENT_THREAD_NAME_PREFIX = "Oak Superagent";
 const execFileAsync = promisify(execFile);
+
+type OakSessionChannel = ThreadChannel | DMChannel;
 
 interface SessionContext {
   record: SessionRecord;
-  thread: ThreadChannel;
+  thread: OakSessionChannel;
   client: OakCodexClient;
   ready: boolean;
   needsClientRefresh: boolean;
@@ -89,11 +112,13 @@ interface SessionContext {
   lastCommentaryTurnId: string | null;
   lastCommentaryText: string;
   lastCommentaryMessageIds: string[];
+  lastFinalAnswerTurnId: string | null;
   typingTimer: NodeJS.Timeout | null;
   rolloutPoller: NodeJS.Timeout | null;
   reconnectTimer: NodeJS.Timeout | null;
   reconnectInFlight: Promise<void> | null;
   reconnectAttempt: number;
+  reconnectStartedAt: number | null;
   restartResumeTimer: NodeJS.Timeout | null;
   restartResumeInFlight: Promise<void> | null;
   restartResumeAttempt: number;
@@ -102,6 +127,8 @@ interface SessionContext {
   interruptingTurnId: string | null;
   lastReportedErrorText: string | null;
   lastReportedErrorAt: number;
+  lastAccountSwitchText: string | null;
+  lastAccountSwitchAt: number;
 }
 
 interface OakCommandResult {
@@ -110,11 +137,13 @@ interface OakCommandResult {
 }
 
 const sessionStore = new SessionStore(oakConfig.sessionsPath);
+const superagentStore = new OakSuperagentStore(oakConfig.superagentsPath);
 const oakAccessConfigStore = new OakAccessConfigStore(
   oakConfig.configPath,
   oakBootstrapConfig,
 );
 const sessions = new Map<string, SessionContext>();
+const handledDmMessageIds = new Set<string>();
 const OAK_RESTART_CONTINUE_TEXT = "Codex was restarted. Continue.";
 let oakModelOptionsCache: {
   expiresAt: number;
@@ -127,6 +156,62 @@ function log(message: string, context?: Record<string, unknown>): void {
     return;
   }
   console.log(`[oak] ${message}`);
+}
+
+function getOakAdminWorkspaceRoot(): string {
+  return path.join(os.homedir(), ".oak");
+}
+
+function getOakAdminWorkspace(): OakWorkspaceConfig {
+  const now = new Date().toISOString();
+  return {
+    key: OAK_ADMIN_WORKSPACE_KEY,
+    root: getOakAdminWorkspaceRoot(),
+    allowedUserIds: oakConfig.ownerUserId ? [oakConfig.ownerUserId] : [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function getSuperagentWorkspace(workspaceKey: string): OakWorkspaceConfig | null {
+  if (workspaceKey === OAK_ADMIN_WORKSPACE_KEY) {
+    return getOakAdminWorkspace();
+  }
+  return oakAccessConfigStore.getWorkspace(workspaceKey);
+}
+
+function getSessionChannelName(channel: OakSessionChannel): string {
+  return "name" in channel && typeof channel.name === "string"
+    ? channel.name
+    : "Oak DM Superagent";
+}
+
+function getSessionChannelGuildId(channel: OakSessionChannel): string | null {
+  return "guildId" in channel && typeof channel.guildId === "string"
+    ? channel.guildId
+    : null;
+}
+
+function getSessionChannelParentId(channel: OakSessionChannel): string | null {
+  return "parentId" in channel && typeof channel.parentId === "string"
+    ? channel.parentId
+    : null;
+}
+
+function markDmMessageHandled(messageId: string): boolean {
+  if (handledDmMessageIds.has(messageId)) {
+    return false;
+  }
+  handledDmMessageIds.add(messageId);
+  if (handledDmMessageIds.size > 1000) {
+    const firstId = handledDmMessageIds.values().next().value as
+      | string
+      | undefined;
+    if (firstId) {
+      handledDmMessageIds.delete(firstId);
+    }
+  }
+  return true;
 }
 
 function normalizeWhitespace(value: string): string {
@@ -234,6 +319,19 @@ function rewriteDiscordFileReferences(text: string): string {
         return match;
       }
       return `\`${rightPath}#${rightAnchor}\``;
+    },
+  );
+}
+
+function stripNonHttpDiscordMarkdownLinks(text: string): string {
+  return text.replaceAll(
+    /\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"\n]*")?\)/g,
+    (match, label: string, destination: string) => {
+      const normalizedDestination = destination.replace(/^<|>$/g, "");
+      if (/^https?:\/\//i.test(normalizedDestination)) {
+        return match;
+      }
+      return label;
     },
   );
 }
@@ -523,7 +621,9 @@ function splitDiscordText(
   text: string,
   maxLength = DISCORD_MESSAGE_LIMIT,
 ): string[] {
-  const normalized = text.replace(/\r/g, "").trim();
+  const normalized = stripNonHttpDiscordMarkdownLinks(text)
+    .replace(/\r/g, "")
+    .trim();
   if (!normalized) {
     return [];
   }
@@ -611,7 +711,9 @@ function truncateDiscordContent(
   text: string,
   maxLength = DISCORD_MESSAGE_LIMIT,
 ): string {
-  const normalized = text.replace(/\r/g, "").trim();
+  const normalized = stripNonHttpDiscordMarkdownLinks(text)
+    .replace(/\r/g, "")
+    .trim();
   if (normalized.length <= maxLength) {
     return normalized;
   }
@@ -829,7 +931,7 @@ function buildTextThreadName(message: Message, botUserId: string): string {
 }
 
 async function sendSmallText(
-  target: ThreadChannel,
+  target: OakSessionChannel,
   title: string,
   text: string,
 ): Promise<void> {
@@ -843,7 +945,7 @@ async function sendSmallText(
 }
 
 async function sendCompactText(
-  target: ThreadChannel,
+  target: OakSessionChannel,
   text: string,
 ): Promise<Message[]> {
   const normalizedText = rewriteDiscordFileReferences(text);
@@ -858,7 +960,7 @@ async function sendCompactText(
 }
 
 async function sendCompactCommand(
-  target: ThreadChannel,
+  target: OakSessionChannel,
   command: string,
 ): Promise<void> {
   const normalized = normalizeDisplayedCommand(command);
@@ -993,6 +1095,49 @@ function buildSyntheticTextInput(text: string): OakUserInput[] {
   ];
 }
 
+function buildTokenUsageRecord(usage: OakTokenUsage): OakTokenUsageRecord {
+  return {
+    totalTokens: usage.totalTokens,
+    inputTokens: usage.inputTokens,
+    cachedInputTokens: usage.cachedInputTokens,
+    outputTokens: usage.outputTokens,
+    reasoningOutputTokens: usage.reasoningOutputTokens,
+    modelContextWindow: usage.modelContextWindow,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function formatContextUsage(record: SessionRecord): string {
+  const usage = record.tokenUsage;
+  if (!usage) {
+    return [
+      "Context usage is not available yet. Send a turn first.",
+      `Compaction: \`${record.compactionStatus}\``,
+    ].join("\n");
+  }
+
+  if (!usage.modelContextWindow) {
+    return [
+      `Context usage: \`${usage.totalTokens.toLocaleString()}\` tokens. Model context window was not reported.`,
+      `Compaction: \`${record.compactionStatus}\``,
+    ].join("\n");
+  }
+
+  const percent = Math.min(
+    100,
+    Math.max(0, (usage.totalTokens / usage.modelContextWindow) * 100),
+  );
+  const lines = [
+    `Context usage: \`${percent.toFixed(1)}%\``,
+    `Tokens: \`${usage.totalTokens.toLocaleString()}\` / \`${usage.modelContextWindow.toLocaleString()}\``,
+    `Compaction: \`${record.compactionStatus}\``,
+  ];
+  if (record.compactionFailureReason) {
+    lines.push(`Last compaction error: \`${record.compactionFailureReason}\``);
+  }
+  return lines.join("\n");
+}
+
 function upsertTrackedAgent(
   agents: readonly OakTrackedAgentRecord[],
   nextAgent: OakTrackedAgentRecord,
@@ -1051,7 +1196,9 @@ function isTransientCodexConnectionError(message: string): boolean {
 
 function isMissingCodexRolloutResumeError(error: unknown): boolean {
   const message =
-    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    error instanceof Error
+      ? error.message.toLowerCase()
+      : String(error).toLowerCase();
   return (
     message.includes("codex_request_error: thread/resume:") &&
     message.includes("no rollout found")
@@ -1142,6 +1289,16 @@ async function autoSwitchCodexProfileAfterError(
   if (!shouldOfferCodexSwitch(message)) {
     return;
   }
+  const normalizedSwitchText = normalizeWhitespace(message);
+  const now = Date.now();
+  if (
+    session.lastAccountSwitchText === normalizedSwitchText &&
+    now - session.lastAccountSwitchAt < 60_000
+  ) {
+    return;
+  }
+  session.lastAccountSwitchText = normalizedSwitchText;
+  session.lastAccountSwitchAt = now;
 
   const activeProfile = await syncActiveCodexProfile();
   const summary = await getOakRateLimitSummary({
@@ -1167,7 +1324,7 @@ async function autoSwitchCodexProfileAfterError(
 
   try {
     statusLines.push(await switchCodexProfileWithStatus(selectedProfile));
-    await restartCodex();
+    await restartCodex({ resumeSessions: [session] });
     statusLines.push("Requested a Codex app-server restart.");
   } catch (error) {
     statusLines.push(error instanceof Error ? error.message : String(error));
@@ -1192,7 +1349,9 @@ async function persistSession(session: SessionContext): Promise<void> {
   await sessionStore.set(session.record);
 }
 
-async function sendSessionThreadInfoMessage(session: SessionContext): Promise<void> {
+async function sendSessionThreadInfoMessage(
+  session: SessionContext,
+): Promise<void> {
   const workspace = getSessionWorkspace(session);
   const message = await session.thread.send(
     [
@@ -1200,7 +1359,7 @@ async function sendSessionThreadInfoMessage(session: SessionContext): Promise<vo
       `Workspace: \`${workspace.root}\``,
     ].join("\n"),
   );
-  await message.pin("Oak session info");
+  await message.pin("Oak session info").catch(() => {});
 }
 
 async function markSessionStreamingState(
@@ -1277,10 +1436,16 @@ async function setSessionPendingRestartContinue(
   session: SessionContext,
   pending: boolean,
 ): Promise<void> {
+  const restartRecoveryTurnId = pending
+    ? (session.record.activeTurnId ?? session.client.currentTurnId)
+    : null;
   session.record = {
     ...session.record,
     pendingRestartContinue: pending,
     pendingRestartContinueAt: pending ? new Date().toISOString() : null,
+    restartRecoveryTurnId,
+    recoveryFailureReason: null,
+    recoveryFailedAt: null,
     activeTurnId: pending ? null : session.record.activeTurnId,
     streamingActive: pending ? false : session.record.streamingActive,
     updatedAt: new Date().toISOString(),
@@ -1288,13 +1453,66 @@ async function setSessionPendingRestartContinue(
   await persistSession(session);
 }
 
+async function markSessionRecoveryFailed(
+  session: SessionContext,
+  reason: string,
+): Promise<void> {
+  cancelSessionReconnect(session);
+  cancelSessionRestartResume(session);
+  setTyping(session, false);
+  resetCommentaryState(session);
+  if (session.rolloutPoller) {
+    clearInterval(session.rolloutPoller);
+    session.rolloutPoller = null;
+  }
+  session.record = {
+    ...session.record,
+    activeTurnId: null,
+    streamingActive: false,
+    pendingRestartContinue: false,
+    pendingRestartContinueAt: null,
+    recoveryFailureReason: reason,
+    recoveryFailedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await persistSession(session);
+  await sendSmallText(session.thread, "Recovery Failed", reason);
+}
+
+async function setSessionCompactionStatus(
+  session: SessionContext,
+  status: SessionRecord["compactionStatus"],
+  failureReason: string | null = null,
+): Promise<void> {
+  session.record = {
+    ...session.record,
+    compactionStatus: status,
+    compactionUpdatedAt: new Date().toISOString(),
+    compactionFailureReason: failureReason,
+    updatedAt: new Date().toISOString(),
+  };
+  await persistSession(session);
+}
+
+async function requestSessionCompaction(session: SessionContext): Promise<void> {
+  if (session.client.isWorking || sessionHasActiveStreaming(session)) {
+    throw new Error("Cannot compact context while a Codex turn is running.");
+  }
+
+  await setSessionCompactionStatus(session, "running");
+  try {
+    await session.client.compactThread();
+    await setSessionCompactionStatus(session, "requested");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await setSessionCompactionStatus(session, "failed", message);
+    throw error;
+  }
+}
+
 async function setSessionCodexOutputKind(
   session: SessionContext,
-  kind:
-    | "reasoning"
-    | "command_execution"
-    | "commentary"
-    | "final_answer",
+  kind: "reasoning" | "command_execution" | "commentary" | "final_answer",
 ): Promise<void> {
   if (session.record.lastCodexOutputKind === kind) {
     return;
@@ -1311,7 +1529,18 @@ async function setSessionCodexOutputKind(
 async function commitSessionFinalAnswer(
   session: SessionContext,
   text: string,
+  turnId: string | null = null,
 ): Promise<void> {
+  if (
+    session.lastFinalAnswerTurnId === turnId &&
+    normalizeWhitespace(session.record.lastAssistantResponse ?? "") ===
+      normalizeWhitespace(text)
+  ) {
+    resetCommentaryState(session);
+    setTyping(session, false);
+    return;
+  }
+
   const shouldReplacePostedCommentary =
     session.record.lastCodexOutputKind === "commentary" &&
     session.lastCommentaryMessageIds.length > 0 &&
@@ -1335,12 +1564,14 @@ async function commitSessionFinalAnswer(
     lastCodexOutputKind: "final_answer",
     updatedAt: new Date().toISOString(),
   };
+  session.lastFinalAnswerTurnId = turnId;
   await persistSession(session);
   await sendFinalAnswer(session, text);
 }
 
 async function promoteCommentaryToFinalAnswer(
   session: SessionContext,
+  turnId: string | null = session.record.activeTurnId,
 ): Promise<boolean> {
   if (session.record.lastCodexOutputKind === "final_answer") {
     return false;
@@ -1351,7 +1582,7 @@ async function promoteCommentaryToFinalAnswer(
     return false;
   }
 
-  await commitSessionFinalAnswer(session, fallbackText);
+  await commitSessionFinalAnswer(session, fallbackText, turnId);
   return true;
 }
 
@@ -1374,24 +1605,27 @@ async function getFileSize(filePath: string | null): Promise<number> {
 async function readAppendedText(
   filePath: string,
   startOffset: number,
-): Promise<{ text: string; endOffset: number }> {
+): Promise<{ text: string; endOffset: number; resetRemainder: boolean }> {
   const metadata = await stat(filePath);
-  if (metadata.size <= startOffset) {
+  const readOffset = metadata.size < startOffset ? 0 : startOffset;
+  if (metadata.size <= readOffset) {
     return {
       text: "",
       endOffset: metadata.size,
+      resetRemainder: metadata.size < startOffset,
     };
   }
 
   const fileHandle = await open(filePath, "r");
 
   try {
-    const length = metadata.size - startOffset;
+    const length = metadata.size - readOffset;
     const buffer = Buffer.alloc(length);
-    await fileHandle.read(buffer, 0, length, startOffset);
+    await fileHandle.read(buffer, 0, length, readOffset);
     return {
       text: buffer.toString("utf8"),
       endOffset: metadata.size,
+      resetRemainder: readOffset === 0 && startOffset > 0,
     };
   } finally {
     await fileHandle.close();
@@ -1563,6 +1797,7 @@ function cancelSessionReconnect(session: SessionContext): void {
     session.reconnectTimer = null;
   }
   session.reconnectAttempt = 0;
+  session.reconnectStartedAt = null;
 }
 
 function cancelSessionRestartResume(session: SessionContext): void {
@@ -1596,6 +1831,7 @@ async function reconnectSession(session: SessionContext): Promise<void> {
       startRolloutPolling(session);
       await pollRolloutFile(session);
       session.reconnectAttempt = 0;
+      session.reconnectStartedAt = null;
     } finally {
       session.reconnectInFlight = null;
     }
@@ -1611,6 +1847,22 @@ function scheduleSessionReconnect(session: SessionContext): void {
     session.reconnectInFlight ||
     !sessionHasActiveStreaming(session)
   ) {
+    return;
+  }
+
+  if (!session.reconnectStartedAt) {
+    session.reconnectStartedAt = Date.now();
+  }
+  if (Date.now() - session.reconnectStartedAt > OAK_RECOVERY_MAX_ELAPSED_MS) {
+    void markSessionRecoveryFailed(
+      session,
+      "Codex reconnect did not recover before Oak's recovery timeout.",
+    ).catch((error) => {
+      console.error("[oak] Failed to mark reconnect failure:", {
+        threadId: session.thread.id,
+        error,
+      });
+    });
     return;
   }
 
@@ -1700,6 +1952,25 @@ function scheduleSessionRestartResume(session: SessionContext): void {
     return;
   }
 
+  const startedAtMs = session.record.pendingRestartContinueAt
+    ? Date.parse(session.record.pendingRestartContinueAt)
+    : Date.now();
+  if (
+    Number.isFinite(startedAtMs) &&
+    Date.now() - startedAtMs > OAK_RECOVERY_MAX_ELAPSED_MS
+  ) {
+    void markSessionRecoveryFailed(
+      session,
+      "Codex restart recovery did not complete before Oak's recovery timeout.",
+    ).catch((error) => {
+      console.error("[oak] Failed to mark restart recovery failure:", {
+        threadId: session.thread.id,
+        error,
+      });
+    });
+    return;
+  }
+
   const delayMs = Math.min(1000 * 2 ** session.restartResumeAttempt, 15000);
   session.restartResumeTimer = setTimeout(() => {
     session.restartResumeTimer = null;
@@ -1711,6 +1982,50 @@ function scheduleSessionRestartResume(session: SessionContext): void {
       scheduleSessionRestartResume(session);
     });
   }, delayMs);
+}
+
+async function notifySuperagentSubscriptions(
+  completedSession: SessionContext,
+): Promise<void> {
+  const subscriptions = superagentStore.listSubscriptionsForTarget({
+    discordThreadId: completedSession.thread.id,
+    codexThreadId: completedSession.record.codexThreadId,
+  });
+  if (subscriptions.length === 0) {
+    return;
+  }
+
+  const summary =
+    completedSession.record.lastAssistantResponse?.trim() ||
+    "The subscribed thread completed without a final answer recorded by Oak.";
+
+  for (const subscription of subscriptions) {
+    const superagentThread = await fetchSessionChannel(
+      completedSession.thread.client,
+      subscription.superagentDiscordThreadId,
+    );
+    if (!superagentThread) {
+      continue;
+    }
+    const superagentSession = await getOrCreateSession(superagentThread);
+    if (!superagentSession) {
+      continue;
+    }
+
+    await dispatchTextToSession(
+      superagentSession,
+      [
+        "Subscribed Oak thread completed.",
+        `Discord thread: ${completedSession.thread.id}`,
+        `Codex thread: ${completedSession.record.codexThreadId}`,
+        "",
+        "Last Oak response:",
+        summary,
+      ].join("\n"),
+      null,
+    );
+    await superagentStore.markSubscriptionDelivered(subscription.id);
+  }
 }
 
 async function handleSessionEvent(
@@ -1748,7 +2063,10 @@ async function handleSessionEvent(
         if (session.interruptingTurnId) {
           session.interruptingTurnId = null;
         } else {
-          await promoteCommentaryToFinalAnswer(session);
+          await promoteCommentaryToFinalAnswer(
+            session,
+            session.record.activeTurnId,
+          );
         }
         setTyping(session, false);
         resetCommentaryState(session);
@@ -1761,6 +2079,21 @@ async function handleSessionEvent(
           });
         }
       }
+      return;
+    case "token_usage":
+      session.record = {
+        ...session.record,
+        tokenUsage: buildTokenUsageRecord(event.usage),
+        updatedAt: new Date().toISOString(),
+      };
+      await persistSession(session);
+      return;
+    case "context_compaction":
+      await setSessionCompactionStatus(session, "requested");
+      await sendCompactText(
+        session.thread,
+        "Automatically compacting context.",
+      );
       return;
     case "reasoning":
       if (isSuppressedInterruptedTurn(session, event.turnId)) {
@@ -1845,7 +2178,7 @@ async function handleSessionEvent(
       }
 
       resetCommentaryState(session);
-      await commitSessionFinalAnswer(session, event.text);
+      await commitSessionFinalAnswer(session, event.text, event.turnId);
       session.client.markTurnCompleted(event.turnId);
       return;
     case "turn_aborted":
@@ -1868,7 +2201,7 @@ async function handleSessionEvent(
       if (isSuppressedInterruptedTurn(session, event.turnId)) {
         session.interruptingTurnId = null;
       } else {
-        await promoteCommentaryToFinalAnswer(session);
+        await promoteCommentaryToFinalAnswer(session, event.turnId);
       }
       setTyping(session, false);
       resetCommentaryState(session);
@@ -1882,6 +2215,7 @@ async function handleSessionEvent(
       if (sessionHasPendingRestartContinue(session)) {
         await setSessionPendingRestartContinue(session, false);
       }
+      await notifySuperagentSubscriptions(session);
       return;
     case "error":
       setTyping(session, false);
@@ -1952,6 +2286,9 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
   }
 
   session.rolloutReadOffset = appended.endOffset;
+  if (appended.resetRemainder) {
+    session.rolloutLineRemainder = "";
+  }
   if (session.record.rolloutReadOffset !== appended.endOffset) {
     await markSessionStreamingState(session, {
       rolloutReadOffset: appended.endOffset,
@@ -2012,7 +2349,7 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
         const turnId =
           typeof payload.turn_id === "string" && payload.turn_id.trim()
             ? payload.turn_id
-            : session.record.activeTurnId ?? "unknown";
+            : (session.record.activeTurnId ?? "unknown");
         await handleSessionEvent(session, {
           type: "assistant_message",
           threadId: session.record.codexThreadId,
@@ -2144,6 +2481,8 @@ async function syncThreadMetadata(session: SessionContext): Promise<void> {
         : session.record.streamingActive ||
           metadata.activeTurnId !== null ||
           metadata.status === "running",
+    lastAssistantResponse:
+      metadata.lastAssistantResponse ?? session.record.lastAssistantResponse,
     updatedAt: new Date().toISOString(),
   };
   await persistSession(session);
@@ -2180,14 +2519,20 @@ function startRolloutPolling(session: SessionContext): void {
 }
 
 function getSessionWorkspace(session: SessionContext): OakWorkspaceConfig {
+  if (!getSessionChannelGuildId(session.thread) && !session.record.guildId) {
+    return getOakAdminWorkspace();
+  }
+
   const scope = resolveOakWorkspaceForLocation({
-    guildId: session.thread.guildId ?? session.record.guildId,
+    guildId: getSessionChannelGuildId(session.thread) ?? session.record.guildId,
     channelId: session.thread.id,
     parentChannelId:
-      session.thread.parentId ?? session.record.discordParentChannelId,
+      getSessionChannelParentId(session.thread) ??
+      session.record.discordParentChannelId,
   });
   if (!scope) {
-    const guildId = session.thread.guildId ?? session.record.guildId;
+    const guildId =
+      getSessionChannelGuildId(session.thread) ?? session.record.guildId;
     throw new Error(
       guildId
         ? `Oak is not configured for guild \`${guildId}\` in this channel.`
@@ -2239,7 +2584,9 @@ async function ensureSessionReady(session: SessionContext): Promise<void> {
       }
 
       const previousThreadId = session.record.codexThreadId;
-      const codexThreadId = await session.client.startThread(session.thread.name);
+      const codexThreadId = await session.client.startThread(
+        getSessionChannelName(session.thread),
+      );
       session.record = {
         ...session.record,
         codexThreadId,
@@ -2257,7 +2604,9 @@ async function ensureSessionReady(session: SessionContext): Promise<void> {
       await sendSessionThreadInfoMessage(session);
     }
   } else {
-    const codexThreadId = await session.client.startThread(session.thread.name);
+    const codexThreadId = await session.client.startThread(
+      getSessionChannelName(session.thread),
+    );
     session.record = {
       ...session.record,
       codexThreadId,
@@ -2276,7 +2625,7 @@ async function ensureSessionReady(session: SessionContext): Promise<void> {
 }
 
 function buildSessionContext(
-  thread: ThreadChannel,
+  thread: OakSessionChannel,
   record: SessionRecord,
 ): SessionContext {
   const session: SessionContext = {
@@ -2289,11 +2638,13 @@ function buildSessionContext(
     lastCommentaryTurnId: null,
     lastCommentaryText: "",
     lastCommentaryMessageIds: [],
+    lastFinalAnswerTurnId: null,
     typingTimer: null,
     rolloutPoller: null,
     reconnectTimer: null,
     reconnectInFlight: null,
     reconnectAttempt: 0,
+    reconnectStartedAt: null,
     restartResumeTimer: null,
     restartResumeInFlight: null,
     restartResumeAttempt: 0,
@@ -2302,6 +2653,8 @@ function buildSessionContext(
     interruptingTurnId: null,
     lastReportedErrorText: null,
     lastReportedErrorAt: 0,
+    lastAccountSwitchText: null,
+    lastAccountSwitchAt: 0,
   };
 
   attachSessionEventBridge(session);
@@ -2309,7 +2662,7 @@ function buildSessionContext(
 }
 
 async function getOrCreateSession(
-  thread: ThreadChannel,
+  thread: OakSessionChannel,
 ): Promise<SessionContext | null> {
   const existing = sessions.get(thread.id);
   if (existing) {
@@ -2322,18 +2675,20 @@ async function getOrCreateSession(
     return null;
   }
 
-  if (
-    !resolveOakWorkspaceForLocation({
-      guildId: thread.guildId ?? record.guildId,
+  if (getSessionChannelGuildId(thread) ?? record.guildId) {
+    const scope = resolveOakWorkspaceForLocation({
+      guildId: getSessionChannelGuildId(thread) ?? record.guildId,
       channelId: thread.id,
-      parentChannelId: thread.parentId ?? record.discordParentChannelId,
-    })
-  ) {
-    log("Skipping Oak session outside configured Oak scope", {
-      threadId: thread.id,
-      guildId: thread.guildId ?? record.guildId,
+      parentChannelId:
+        getSessionChannelParentId(thread) ?? record.discordParentChannelId,
     });
-    return null;
+    if (!scope) {
+      log("Skipping Oak session outside configured Oak scope", {
+        threadId: thread.id,
+        guildId: getSessionChannelGuildId(thread) ?? record.guildId,
+      });
+      return null;
+    }
   }
 
   const session: SessionContext = {
@@ -2346,11 +2701,13 @@ async function getOrCreateSession(
     lastCommentaryTurnId: null,
     lastCommentaryText: "",
     lastCommentaryMessageIds: [],
+    lastFinalAnswerTurnId: null,
     typingTimer: null,
     rolloutPoller: null,
     reconnectTimer: null,
     reconnectInFlight: null,
     reconnectAttempt: 0,
+    reconnectStartedAt: null,
     restartResumeTimer: null,
     restartResumeInFlight: null,
     restartResumeAttempt: 0,
@@ -2359,6 +2716,8 @@ async function getOrCreateSession(
     interruptingTurnId: null,
     lastReportedErrorText: null,
     lastReportedErrorAt: 0,
+    lastAccountSwitchText: null,
+    lastAccountSwitchAt: 0,
   };
 
   attachSessionEventBridge(session);
@@ -2476,33 +2835,38 @@ async function refreshSessionClient(session: SessionContext): Promise<void> {
 }
 
 async function createFreshSession(
-  thread: ThreadChannel,
+  thread: OakSessionChannel,
+  workspaceOverride?: OakWorkspaceConfig,
 ): Promise<SessionContext> {
   const existing = sessions.get(thread.id);
   if (existing) {
     return existing;
   }
 
-  if (
-    !resolveOakWorkspaceForLocation({
-      guildId: thread.guildId,
-      channelId: thread.id,
-      parentChannelId: thread.parentId,
-    })
-  ) {
-    throw new Error(
-      thread.guildId
-        ? `Oak is not configured for guild \`${thread.guildId}\` in this channel.`
-        : "Oak sessions require a guild.",
-    );
+  const guildId = getSessionChannelGuildId(thread);
+  const parentChannelId = getSessionChannelParentId(thread);
+  if (!workspaceOverride) {
+    if (
+      !resolveOakWorkspaceForLocation({
+        guildId,
+        channelId: thread.id,
+        parentChannelId,
+      })
+    ) {
+      throw new Error(
+        guildId
+          ? `Oak is not configured for guild \`${guildId}\` in this channel.`
+          : "Oak sessions require a guild.",
+      );
+    }
   }
 
   const session: SessionContext = {
     ...buildSessionContext(thread, {
       discordThreadId: thread.id,
-      discordThreadName: thread.name,
-      guildId: thread.guildId,
-      discordParentChannelId: thread.parentId,
+      discordThreadName: getSessionChannelName(thread),
+      guildId,
+      discordParentChannelId: parentChannelId,
       lastInteractorUserId: null,
       serviceTier: oakConfig.serviceTier,
       fastModeEnabled: false,
@@ -2516,8 +2880,15 @@ async function createFreshSession(
       activeAgents: [],
       pendingRestartContinue: false,
       pendingRestartContinueAt: null,
+      restartRecoveryTurnId: null,
+      recoveryFailureReason: null,
+      recoveryFailedAt: null,
+      compactionStatus: "idle",
+      compactionUpdatedAt: null,
+      compactionFailureReason: null,
       rolloutReadOffset: 0,
       lastAssistantResponse: null,
+      tokenUsage: null,
       lastCodexOutputKind: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -2540,9 +2911,9 @@ async function createResumedSession(
   const session = buildSessionContext(thread, {
     ...sourceRecord,
     discordThreadId: thread.id,
-    discordThreadName: thread.name,
-    guildId: thread.guildId,
-    discordParentChannelId: thread.parentId,
+    discordThreadName: getSessionChannelName(thread),
+    guildId: getSessionChannelGuildId(thread),
+    discordParentChannelId: getSessionChannelParentId(thread),
     updatedAt: now,
     createdAt: now,
   });
@@ -2561,9 +2932,9 @@ async function applyResumedRecordToSession(
   session.record = {
     ...sourceRecord,
     discordThreadId: session.thread.id,
-    discordThreadName: session.thread.name,
-    guildId: session.thread.guildId,
-    discordParentChannelId: session.thread.parentId,
+    discordThreadName: getSessionChannelName(session.thread),
+    guildId: getSessionChannelGuildId(session.thread),
+    discordParentChannelId: getSessionChannelParentId(session.thread),
     lastInteractorUserId,
     updatedAt: now,
   };
@@ -2620,6 +2991,37 @@ async function startSessionTurn(
   });
 }
 
+async function dispatchTextToSession(
+  session: SessionContext,
+  text: string,
+  lastInteractorUserId: string | null,
+): Promise<"started" | "steered"> {
+  if (
+    session.needsClientRefresh &&
+    !session.client.isWorking &&
+    !sessionHasActiveStreaming(session)
+  ) {
+    await refreshSessionClient(session);
+  }
+
+  await ensureSessionReady(session);
+  session.record = {
+    ...session.record,
+    lastInteractorUserId,
+    updatedAt: new Date().toISOString(),
+  };
+  await persistSession(session);
+
+  const input = buildSyntheticTextInput(text);
+  if (session.client.isWorking) {
+    await session.client.steerTurn(input);
+    return "steered";
+  }
+
+  await startSessionTurn(session, input);
+  return "started";
+}
+
 async function dispatchTurnFromMessage(
   session: SessionContext,
   message: Message,
@@ -2635,8 +3037,8 @@ async function dispatchTurnFromMessage(
   await ensureSessionReady(session);
   session.record = {
     ...session.record,
-    discordThreadName: session.thread.name,
-    discordParentChannelId: session.thread.parentId,
+    discordThreadName: getSessionChannelName(session.thread),
+    discordParentChannelId: getSessionChannelParentId(session.thread),
     lastInteractorUserId: message.author.id,
     updatedAt: new Date().toISOString(),
   };
@@ -2673,6 +3075,196 @@ async function startThreadForTextMessage(
   return thread;
 }
 
+async function fetchThreadChannel(
+  discordClient: Client,
+  threadId: string,
+): Promise<ThreadChannel | null> {
+  const channel = await discordClient.channels
+    .fetch(threadId)
+    .catch(() => null);
+  return channel?.isThread() ? channel : null;
+}
+
+async function fetchSessionChannel(
+  discordClient: Client,
+  channelId: string,
+): Promise<OakSessionChannel | null> {
+  const channel = await discordClient.channels
+    .fetch(channelId)
+    .catch(() => null);
+  if (!channel) {
+    return null;
+  }
+  if (channel.isThread()) {
+    return channel;
+  }
+  if (channel.type !== ChannelType.DM) {
+    return null;
+  }
+  return channel.partial ? await channel.fetch() : channel;
+}
+
+function findWorkspaceRouteChannelId(workspaceKey: string): string | null {
+  const route = oakAccessConfigStore
+    .listRoutes()
+    .find((candidate) => candidate.workspaceKey === workspaceKey);
+  return route?.channelId ?? null;
+}
+
+async function readOakApiReference(): Promise<string> {
+  return await readFile(path.join(oakConfig.repoRoot, "OAK_API.md"), "utf8");
+}
+
+function buildSuperagentBootstrapPrompt(
+  workspace: OakWorkspaceConfig,
+  apiReference: string,
+): string {
+  return [
+    `You are the Oak Superagent for workspace \`${workspace.key}\` at \`${workspace.root}\`.`,
+    "You are a long-lived coordinator thread. Break larger requests into smaller Codex threads by using the local Oak CLI/API described below.",
+    "When you spawn a task thread, subscribe to it so you receive a completion update. Use that update to continue coordination or report back.",
+    "Maintain durable notes in `OAK_MEMORY.md` in your workspace. Read it before planning when it exists, update it when you learn stable facts, and keep it concise.",
+    "The workspace may be dirty. Do not overwrite user changes. Keep delegated tasks scoped.",
+    "",
+    "Oak API reference:",
+    apiReference,
+  ].join("\n");
+}
+
+function buildAdminSuperagentBootstrapPrompt(
+  workspace: OakWorkspaceConfig,
+  apiReference: string,
+): string {
+  return [
+    `You are the owner-only Oak DM Superagent at \`${workspace.root}\`.`,
+    "You coordinate Oak itself and can use the loopback Oak API for workspace, route, access, session, and Discord administration.",
+    "You may run local commands from this workspace when needed. Keep changes deliberate and report high-risk operations before taking them.",
+    "The Oak API includes owner-oriented configuration endpoints and a Discord script endpoint that runs JavaScript in the bot process with `client`, `discord`, and `oak` helpers in scope.",
+    "Maintain concise durable notes in `OAK_MEMORY.md` in this workspace when you learn stable operational facts.",
+    "",
+    "Oak API reference:",
+    apiReference,
+  ].join("\n");
+}
+
+async function createSuperagentThreadInChannel(
+  textChannel: TextChannel,
+  workspace: OakWorkspaceConfig,
+): Promise<ThreadChannel> {
+  const thread = await textChannel.threads.create({
+    name: `${OAK_SUPERAGENT_THREAD_NAME_PREFIX} - ${workspace.key}`,
+    autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+    reason: "Oak workspace superagent",
+  });
+
+  return thread;
+}
+
+async function getOrCreateSuperagentSession(
+  discordClient: Client,
+  workspace: OakWorkspaceConfig,
+  preferredChannel: TextChannel | null,
+): Promise<SessionContext> {
+  const existingRecord = superagentStore.getSuperagent(workspace.key);
+  if (existingRecord) {
+    const existingThread = await fetchThreadChannel(
+      discordClient,
+      existingRecord.discordThreadId,
+    );
+    if (existingThread) {
+      return (
+        (await getOrCreateSession(existingThread)) ??
+        (await createFreshSession(existingThread))
+      );
+    }
+  }
+
+  const routeChannelId =
+    preferredChannel?.id ?? findWorkspaceRouteChannelId(workspace.key);
+  if (!routeChannelId) {
+    throw new Error(
+      `Workspace \`${workspace.key}\` has no concrete routed channel for a superagent thread.`,
+    );
+  }
+
+  const channel =
+    preferredChannel ?? (await discordClient.channels.fetch(routeChannelId));
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    throw new Error(
+      `Workspace \`${workspace.key}\` superagent route is not a text channel.`,
+    );
+  }
+
+  const thread = await createSuperagentThreadInChannel(channel, workspace);
+  const session = await createFreshSession(thread);
+  await ensureSessionReady(session);
+
+  await superagentStore.setSuperagent({
+    workspaceKey: workspace.key,
+    discordThreadId: thread.id,
+    discordParentChannelId: thread.parentId,
+    guildId: thread.guildId,
+    codexThreadId: session.record.codexThreadId || null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  const apiReference = await readOakApiReference();
+  await dispatchTextToSession(
+    session,
+    buildSuperagentBootstrapPrompt(workspace, apiReference),
+    null,
+  );
+  return session;
+}
+
+async function getOrCreateAdminDmSuperagentSession(
+  discordClient: Client,
+): Promise<SessionContext> {
+  if (!oakConfig.ownerUserId) {
+    throw new Error("OAK_OWNER_ID is required for the DM Superagent.");
+  }
+
+  await mkdir(getOakAdminWorkspaceRoot(), { recursive: true });
+  const workspace = getOakAdminWorkspace();
+  const existingRecord = superagentStore.getSuperagent(workspace.key);
+  if (existingRecord) {
+    const existingChannel = await fetchSessionChannel(
+      discordClient,
+      existingRecord.discordThreadId,
+    );
+    if (existingChannel) {
+      return (
+        (await getOrCreateSession(existingChannel)) ??
+        (await createFreshSession(existingChannel, workspace))
+      );
+    }
+  }
+
+  const owner = await discordClient.users.fetch(oakConfig.ownerUserId);
+  const dmChannel = await owner.createDM();
+  const session = await createFreshSession(dmChannel, workspace);
+  await ensureSessionReady(session);
+
+  await superagentStore.setSuperagent({
+    workspaceKey: workspace.key,
+    discordThreadId: dmChannel.id,
+    discordParentChannelId: null,
+    guildId: null,
+    codexThreadId: session.record.codexThreadId || null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  const apiReference = await readOakApiReference();
+  await dispatchTextToSession(
+    session,
+    buildAdminSuperagentBootstrapPrompt(workspace, apiReference),
+    null,
+  );
+  return session;
+}
+
 function buildResumeThreadName(sourceRecord: SessionRecord): string {
   const normalized = normalizeWhitespace(sourceRecord.discordThreadName);
   if (normalized) {
@@ -2686,7 +3278,9 @@ async function startThreadForResumeCommand(
   sourceRecord: SessionRecord,
 ): Promise<ThreadChannel> {
   if (interaction.channel?.type !== ChannelType.GuildText) {
-    throw new Error("`/codex-resume` can only start a new thread from a text channel.");
+    throw new Error(
+      "`/codex-resume` can only start a new thread from a text channel.",
+    );
   }
 
   return interaction.channel.threads.create({
@@ -2806,6 +3400,84 @@ function formatCommandResultCodeBlock(
   return `${title}\n${formatCodeBlock("", body || "Done.")}`;
 }
 
+function truncateCodeBlockBody(text: string, maxLength: number): string {
+  const normalized = text.replace(/\r/g, "").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  const suffix = "\n... output truncated ...";
+  return `${normalized.slice(0, maxLength - suffix.length).trimEnd()}${suffix}`;
+}
+
+function formatBoundedCodeBlock(
+  language: string,
+  text: string,
+  maxBodyLength: number,
+): string {
+  return formatCodeBlock(language, truncateCodeBlockBody(text, maxBodyLength));
+}
+
+function formatBoundedCommandResultCodeBlock(
+  title: string,
+  result: OakCommandResult,
+  maxBodyLength: number,
+): string {
+  const body = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  return `${title}\n${formatBoundedCodeBlock("", body || "Done.", maxBodyLength)}`;
+}
+
+function formatYoloStatus(options: {
+  commitMessage?: string | null;
+  commitResult?: OakCommandResult | null;
+  pushResult?: OakCommandResult | null;
+  error?: string | null;
+}): string {
+  const parts: string[] = [];
+
+  if (options.commitMessage) {
+    parts.push(
+      "Commit message:",
+      formatBoundedCodeBlock("text", options.commitMessage, 240),
+    );
+  } else {
+    parts.push("Generating a commit message with Codex.");
+  }
+
+  if (options.commitResult) {
+    parts.push(
+      formatBoundedCommandResultCodeBlock(
+        "Ran `git commit`.",
+        options.commitResult,
+        520,
+      ),
+    );
+  } else if (options.commitMessage) {
+    parts.push("Running `git commit`.");
+  }
+
+  if (options.pushResult) {
+    parts.push(
+      formatBoundedCommandResultCodeBlock(
+        "Ran `git push`.",
+        options.pushResult,
+        760,
+      ),
+    );
+  } else if (options.commitResult) {
+    parts.push("Running `git push`.");
+  }
+
+  if (options.error) {
+    parts.push(
+      "Git command failed.",
+      formatBoundedCodeBlock("", options.error, 900),
+    );
+  }
+
+  return parts.join("\n");
+}
+
 async function generateCommitMessageWithCodex(
   workspaceRoot: string,
 ): Promise<string> {
@@ -2814,7 +3486,10 @@ async function generateCommitMessageWithCodex(
     buildOakThreadPreferences(oakConfig.model, oakConfig.reasoningEffort),
     oakConfig.serviceTier,
     (event) => {
-      if (event.type === "assistant_message" && event.phase === "final_answer") {
+      if (
+        event.type === "assistant_message" &&
+        event.phase === "final_answer"
+      ) {
         finalAnswer = event.text.trim();
       }
     },
@@ -2866,6 +3541,11 @@ async function handleGitCommand(
     return true;
   }
 
+  let gitProgressReply: Message | null = null;
+  let yoloCommitMessage: string | null = null;
+  let yoloCommitResult: OakCommandResult | null = null;
+  let yoloNothingToCommit = false;
+
   try {
     const workspaceRoot = scope.workspace.root;
 
@@ -2885,7 +3565,10 @@ async function handleGitCommand(
         return true;
       }
 
-      const pullResult = await runGitCommand(workspaceRoot, ["pull", "--ff-only"]);
+      const pullResult = await runGitCommand(workspaceRoot, [
+        "pull",
+        "--ff-only",
+      ]);
       await sendMessageReplyText(
         message,
         formatCommandResultSummary("Ran `git pull --ff-only`.", pullResult),
@@ -2940,18 +3623,62 @@ async function handleGitCommand(
     const status = await getWorkspaceGitStatus(workspaceRoot);
     if (!status) {
       if (command === "yolo") {
+        yoloNothingToCommit = true;
+        gitProgressReply = await message.reply(
+          withSafeDiscordContent({
+            content: "Nothing to commit. Running `git push`.",
+          }),
+        );
         const pushResult = await runGitCommand(workspaceRoot, ["push"]);
-        await sendMessageReplyText(
-          message,
-          formatCommandResultCodeBlock(
-            "Nothing to commit. Ran `git push`.",
-            pushResult,
-          ),
+        await gitProgressReply.edit(
+          withSafeDiscordContent({
+            content: formatBoundedCommandResultCodeBlock(
+              "Nothing to commit. Ran `git push`.",
+              pushResult,
+              1600,
+            ),
+          }),
         );
         return true;
       }
 
       await sendMessageReplyText(message, "Nothing to commit.");
+      return true;
+    }
+
+    if (command === "yolo") {
+      gitProgressReply = await message.reply(
+        withSafeDiscordContent({ content: formatYoloStatus({}) }),
+      );
+      const commitMessage = await generateCommitMessageWithCodex(workspaceRoot);
+      yoloCommitMessage = commitMessage;
+      await gitProgressReply.edit(
+        withSafeDiscordContent({
+          content: formatYoloStatus({ commitMessage }),
+        }),
+      );
+      await runGitCommand(workspaceRoot, ["add", "-A"]);
+      const commitResult = await runGitCommand(workspaceRoot, [
+        "commit",
+        "-m",
+        commitMessage,
+      ]);
+      yoloCommitResult = commitResult;
+      await gitProgressReply.edit(
+        withSafeDiscordContent({
+          content: formatYoloStatus({ commitMessage, commitResult }),
+        }),
+      );
+      const pushResult = await runGitCommand(workspaceRoot, ["push"]);
+      await gitProgressReply.edit(
+        withSafeDiscordContent({
+          content: formatYoloStatus({
+            commitMessage,
+            commitResult,
+            pushResult,
+          }),
+        }),
+      );
       return true;
     }
 
@@ -2990,27 +3717,62 @@ async function handleGitCommand(
     return true;
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
+    if (gitProgressReply) {
+      const content = yoloNothingToCommit
+        ? [
+            "Nothing to commit. `git push` failed.",
+            formatBoundedCodeBlock("", messageText, 1200),
+          ].join("\n")
+        : formatYoloStatus({
+            commitMessage: yoloCommitMessage,
+            commitResult: yoloCommitResult,
+            error: messageText,
+          });
+      await gitProgressReply.edit(
+        withSafeDiscordContent({
+          content,
+        }),
+      );
+      return true;
+    }
+
     await sendMessageReplyText(message, `Git command failed.\n${messageText}`);
     return true;
   }
 }
 
-async function restartCodex(): Promise<void> {
-  const sessionsToResume = [...sessions.values()].filter((session) =>
-    sessionHasActiveWork(session),
-  );
-
-  for (const session of sessionsToResume) {
-    await setSessionPendingRestartContinue(session, true);
-  }
-
+async function restartCodex(options?: {
+  resumeSessions?: readonly SessionContext[];
+}): Promise<void> {
   if (!supervisorControlsRestart()) {
     throw new Error(
       "Codex restart requires Oak to be started through the supervisor.",
     );
   }
 
-  await requestSupervisorRestart("codex");
+  const sessionsToResume = [
+    ...new Set([
+      ...[...sessions.values()].filter((session) =>
+        sessionHasActiveWork(session),
+      ),
+      ...(options?.resumeSessions ?? []),
+    ]),
+  ];
+
+  for (const session of sessionsToResume) {
+    await setSessionPendingRestartContinue(session, true);
+  }
+
+  try {
+    await requestSupervisorRestart("codex");
+  } catch (error) {
+    await Promise.allSettled(
+      sessionsToResume.map((session) =>
+        setSessionPendingRestartContinue(session, false),
+      ),
+    );
+    throw error;
+  }
 
   for (const session of sessions.values()) {
     session.ready = false;
@@ -3035,15 +3797,19 @@ async function recoverInterruptedSessionsOnStartup(
 ): Promise<void> {
   const candidateRecords = sessionStore
     .list()
-    .filter((record) => record.codexThreadId && sessionNeedsContinueAfterStartup(record));
+    .filter(
+      (record) =>
+        record.codexThreadId && sessionNeedsContinueAfterStartup(record),
+    );
 
   for (const record of candidateRecords) {
     try {
-      const channel = await discordClient.channels.fetch(
+      const channel = await fetchSessionChannel(
+        discordClient,
         record.discordThreadId,
       );
-      if (!channel?.isThread()) {
-        log("Skipping Oak startup recovery for non-thread channel", {
+      if (!channel) {
+        log("Skipping Oak startup recovery for missing session channel", {
           discordThreadId: record.discordThreadId,
         });
         continue;
@@ -3076,7 +3842,11 @@ async function handleRestartCommand(
     return false;
   }
 
-  if (normalized !== "restart bot" && normalized !== "restart codex") {
+  if (
+    normalized !== "restart" &&
+    normalized !== "restart bot" &&
+    normalized !== "restart codex"
+  ) {
     return false;
   }
 
@@ -3085,7 +3855,7 @@ async function handleRestartCommand(
     return true;
   }
 
-  if (normalized === "restart bot") {
+  if (normalized === "restart" || normalized === "restart bot") {
     await message.reply("Restarting Oak.");
     if (supervisorControlsRestart()) {
       await requestSupervisorRestart("bot");
@@ -3104,6 +3874,38 @@ async function handleRestartCommand(
   }
 
   return false;
+}
+
+async function handleContextCommand(
+  message: Message,
+  botUserId: string,
+): Promise<boolean> {
+  const normalized = getMentionCommandText(message, botUserId);
+  if (normalized !== "context" && normalized !== "compact") {
+    return false;
+  }
+
+  if (!message.channel.isThread()) {
+    await message.reply("This command only works inside an Oak thread.");
+    return true;
+  }
+
+  const session = await getOrCreateSession(message.channel);
+  if (!session) {
+    await message.reply("This thread is not linked to an Oak session.");
+    return true;
+  }
+
+  await ensureSessionReady(session);
+
+  if (normalized === "context") {
+    await message.reply(formatContextUsage(session.record));
+    return true;
+  }
+
+  await message.reply("Compacting context.");
+  await requestSessionCompaction(session);
+  return true;
 }
 
 function isCodexSwitchCommandMessage(
@@ -3711,7 +4513,8 @@ function listResumableSessionRecords(
     const existing = latestByCodexThreadId.get(record.codexThreadId);
     if (
       !existing ||
-      getSessionRecordUpdatedAtMs(record) > getSessionRecordUpdatedAtMs(existing)
+      getSessionRecordUpdatedAtMs(record) >
+        getSessionRecordUpdatedAtMs(existing)
     ) {
       latestByCodexThreadId.set(record.codexThreadId, record);
     }
@@ -3724,7 +4527,8 @@ function listResumableSessionRecords(
 }
 
 function buildResumeChoiceName(record: SessionRecord): string {
-  const threadName = normalizeWhitespace(record.discordThreadName) || "Untitled";
+  const threadName =
+    normalizeWhitespace(record.discordThreadName) || "Untitled";
   const date =
     record.updatedAt.length >= 10
       ? record.updatedAt.slice(0, 10)
@@ -3841,8 +4645,11 @@ async function buildWorkspaceRootChoices(
         .slice(0, 50)
         .map(async (entry) => {
           const absolutePath = path.join(resolvedBase, entry.name);
-          const stats = entry.isSymbolicLink() ? await stat(absolutePath) : null;
-          const isDirectory = entry.isDirectory() || stats?.isDirectory() === true;
+          const stats = entry.isSymbolicLink()
+            ? await stat(absolutePath)
+            : null;
+          const isDirectory =
+            entry.isDirectory() || stats?.isDirectory() === true;
           if (!isDirectory) {
             return null;
           }
@@ -4263,7 +5070,39 @@ async function handleMessage(
   message: Message,
   botUserId: string,
 ): Promise<void> {
-  if (!getAllowedWorkspaceForMessage(message)) {
+  if (
+    !message.author.bot &&
+    !message.inGuild() &&
+    isProcessableMessageType(message)
+  ) {
+    if (!markDmMessageHandled(message.id)) {
+      return;
+    }
+    if (!isOakAdminUserId(message.author.id)) {
+      log("Ignoring non-owner DM", { userId: message.author.id });
+      return;
+    }
+    log("Received owner DM", { userId: message.author.id });
+    const session = await getOrCreateAdminDmSuperagentSession(message.client);
+    if (isInterruptCommandText(message.content)) {
+      if (session.client.isWorking || sessionHasActiveStreaming(session)) {
+        await ensureSessionReady(session);
+        const interruptedTurnId = await session.client.interruptTurn();
+        session.interruptingTurnId = interruptedTurnId;
+        setTyping(session, false);
+      }
+      await message.reply("Interrupted.");
+      return;
+    }
+    const prompt =
+      message.content.trimStart().replace(/^--\s*/, "").trim() || "(no text)";
+    await dispatchTextToSession(session, prompt, message.author.id);
+    await message.react("👍").catch(() => {});
+    return;
+  }
+
+  const scope = getAllowedWorkspaceForMessage(message);
+  if (!scope) {
     return;
   }
 
@@ -4271,6 +5110,26 @@ async function handleMessage(
     message.channel.isThread() &&
     message.content.trimStart().startsWith("//")
   ) {
+    return;
+  }
+
+  if (message.content.trimStart().startsWith("--")) {
+    const prompt = message.content
+      .trimStart()
+      .replace(/^--\s*/, "")
+      .trim();
+    if (!prompt) {
+      return;
+    }
+    const preferredChannel =
+      message.channel.type === ChannelType.GuildText ? message.channel : null;
+    const session = await getOrCreateSuperagentSession(
+      message.client,
+      scope.workspace,
+      preferredChannel,
+    );
+    await dispatchTextToSession(session, prompt, message.author.id);
+    await message.react("👍").catch(() => {});
     return;
   }
 
@@ -4287,6 +5146,10 @@ async function handleMessage(
   }
 
   if (await handleGitCommand(message, botUserId)) {
+    return;
+  }
+
+  if (await handleContextCommand(message, botUserId)) {
     return;
   }
 
@@ -4327,6 +5190,532 @@ async function handleMessage(
   await dispatchTurnFromMessage(session, message);
 }
 
+async function handleRawDmMessage(
+  discordClient: Client,
+  data: {
+    id?: string;
+    author?: { id?: string; bot?: boolean };
+    channel_id?: string;
+    content?: string;
+    type?: number;
+  },
+): Promise<void> {
+  const messageId = data.id?.trim();
+  const userId = data.author?.id?.trim();
+  const channelId = data.channel_id?.trim();
+  if (
+    !messageId ||
+    !userId ||
+    !channelId ||
+    data.author?.bot ||
+    data.type !== MessageType.Default ||
+    !markDmMessageHandled(messageId)
+  ) {
+    return;
+  }
+
+  if (!isOakAdminUserId(userId)) {
+    log("Ignoring non-owner raw DM", { userId });
+    return;
+  }
+
+  log("Handling owner raw DM", { userId, channelId });
+  const channel = await fetchSessionChannel(discordClient, channelId);
+  if (!channel || channel.type !== ChannelType.DM) {
+    throw new Error(`DM channel not found: ${channelId}`);
+  }
+
+  const session = await getOrCreateAdminDmSuperagentSession(discordClient);
+  if (isInterruptCommandText(data.content ?? "")) {
+    if (session.client.isWorking || sessionHasActiveStreaming(session)) {
+      await ensureSessionReady(session);
+      const interruptedTurnId = await session.client.interruptTurn();
+      session.interruptingTurnId = interruptedTurnId;
+      setTyping(session, false);
+    }
+    await channel.send("Interrupted.");
+    return;
+  }
+
+  const prompt =
+    (data.content ?? "").trimStart().replace(/^--\s*/, "").trim() ||
+    "(no text)";
+  await dispatchTextToSession(session, prompt, userId);
+}
+
+async function readRequestJson(request: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  return raw ? JSON.parse(raw) : {};
+}
+
+function writeJsonResponse(
+  response: ServerResponse,
+  statusCode: number,
+  payload: unknown,
+): void {
+  response.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+  });
+  response.end(`${JSON.stringify(payload, null, 2)}\n`);
+}
+
+function requireStringField(body: unknown, field: string): string {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    typeof (body as Record<string, unknown>)[field] === "string" &&
+    ((body as Record<string, unknown>)[field] as string).trim()
+  ) {
+    return ((body as Record<string, unknown>)[field] as string).trim();
+  }
+  throw new Error(`Missing required string field: ${field}`);
+}
+
+function optionalStringField(body: unknown, field: string): string | null {
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    typeof (body as Record<string, unknown>)[field] === "string"
+  ) {
+    return ((body as Record<string, unknown>)[field] as string).trim() || null;
+  }
+  return null;
+}
+
+function optionalBooleanField(body: unknown, field: string): boolean {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    (body as Record<string, unknown>)[field] === true
+  );
+}
+
+function getOakConfigSnapshot() {
+  return {
+    adminWorkspace: getOakAdminWorkspace(),
+    workspaces: oakAccessConfigStore.listWorkspaces(),
+    routes: oakAccessConfigStore.listRoutes(),
+    superagents: superagentStore.listSuperagents(),
+    sessions: sessionStore.list().map(serializeSession),
+  };
+}
+
+function formatScriptResult(value: unknown): string {
+  return inspect(value, {
+    depth: 5,
+    maxArrayLength: 100,
+    breakLength: 120,
+  });
+}
+
+async function runDiscordAdminScript(
+  discordClient: Client,
+  code: string,
+): Promise<string> {
+  const AsyncFunction = Object.getPrototypeOf(
+    async function () {},
+  ).constructor as new (...args: string[]) => (
+    client: Client,
+    discord: typeof import("discord.js"),
+    oak: Record<string, unknown>,
+  ) => Promise<unknown>;
+  const discord = await import("discord.js");
+  const oak = {
+    accessConfig: oakAccessConfigStore,
+    sessionStore,
+    superagentStore,
+    config: oakConfig,
+    snapshot: getOakConfigSnapshot,
+  };
+  const script = new AsyncFunction("client", "discord", "oak", code);
+  const result = await Promise.race([
+    script(discordClient, discord, oak),
+    new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error("Discord admin script timed out."));
+      }, 30000).unref();
+    }),
+  ]);
+  return formatScriptResult(result);
+}
+
+function serializeSession(session: SessionContext | SessionRecord) {
+  const record = "record" in session ? session.record : session;
+  return {
+    discordThreadId: record.discordThreadId,
+    discordThreadName: record.discordThreadName,
+    guildId: record.guildId,
+    discordParentChannelId: record.discordParentChannelId,
+    codexThreadId: record.codexThreadId,
+    model: record.model,
+    reasoningEffort: record.reasoningEffort,
+    serviceTier: record.serviceTier,
+    fastModeEnabled: record.fastModeEnabled,
+    activeTurnId: record.activeTurnId,
+    streamingActive: record.streamingActive,
+    pendingRestartContinue: record.pendingRestartContinue,
+    restartRecoveryTurnId: record.restartRecoveryTurnId,
+    recoveryFailureReason: record.recoveryFailureReason,
+    recoveryFailedAt: record.recoveryFailedAt,
+    compactionStatus: record.compactionStatus,
+    compactionUpdatedAt: record.compactionUpdatedAt,
+    compactionFailureReason: record.compactionFailureReason,
+    lastAssistantResponse: record.lastAssistantResponse,
+    tokenUsage: record.tokenUsage,
+    updatedAt: record.updatedAt,
+  };
+}
+
+async function getApiSession(
+  discordClient: Client,
+  discordThreadId: string,
+): Promise<SessionContext> {
+  const existing = sessions.get(discordThreadId);
+  if (existing) {
+    return existing;
+  }
+  const channel = await fetchSessionChannel(discordClient, discordThreadId);
+  if (!channel) {
+    throw new Error(`Discord session channel not found: ${discordThreadId}`);
+  }
+  const session = await getOrCreateSession(channel);
+  if (!session) {
+    throw new Error(`Oak session not found: ${discordThreadId}`);
+  }
+  return session;
+}
+
+async function createApiThread(
+  discordClient: Client,
+  body: unknown,
+): Promise<{
+  session: SessionContext;
+  subscription: Awaited<ReturnType<OakSuperagentStore["subscribe"]>> | null;
+}> {
+  const workspaceKey = requireStringField(body, "workspace");
+  const workspace = oakAccessConfigStore.getWorkspace(workspaceKey);
+  if (!workspace) {
+    throw new Error(`Unknown workspace: ${workspaceKey}`);
+  }
+  const shouldSubscribe = optionalBooleanField(body, "subscribe");
+  const subscriptionWorkspaceKey =
+    optionalStringField(body, "subscribeWorkspace") ?? workspace.key;
+  const subscriptionWorkspace = shouldSubscribe
+    ? getSuperagentWorkspace(subscriptionWorkspaceKey)
+    : null;
+  if (shouldSubscribe && !subscriptionWorkspace) {
+    throw new Error(`Unknown workspace: ${subscriptionWorkspaceKey}`);
+  }
+  const superagent = shouldSubscribe
+    ? superagentStore.getSuperagent(subscriptionWorkspace?.key ?? "")
+    : null;
+  if (shouldSubscribe && !superagent) {
+    throw new Error(
+      `Superagent does not exist for workspace: ${subscriptionWorkspace?.key}`,
+    );
+  }
+
+  const channelId =
+    optionalStringField(body, "channelId") ??
+    findWorkspaceRouteChannelId(workspace.key);
+  if (!channelId) {
+    throw new Error(`Workspace \`${workspace.key}\` has no routed channel.`);
+  }
+
+  const channel = await discordClient.channels.fetch(channelId);
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    throw new Error(`Channel \`${channelId}\` is not a text channel.`);
+  }
+
+  const thread = await channel.threads.create({
+    name: optionalStringField(body, "name") ?? `Oak API - ${workspace.key}`,
+    autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+    reason: "Oak local API thread",
+  });
+  const session = await createFreshSession(thread);
+  let subscription: Awaited<ReturnType<OakSuperagentStore["subscribe"]>> | null =
+    null;
+  if (superagent) {
+    subscription = await superagentStore.subscribe({
+      workspaceKey: subscriptionWorkspace?.key ?? workspace.key,
+      superagentDiscordThreadId: superagent.discordThreadId,
+      targetDiscordThreadId: thread.id,
+    });
+  }
+  const prompt = optionalStringField(body, "prompt");
+  if (prompt) {
+    await dispatchTextToSession(session, prompt, null);
+  } else {
+    await ensureSessionReady(session);
+  }
+  return { session, subscription };
+}
+
+async function handleOakApiRequest(
+  discordClient: Client,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  if (
+    request.socket.remoteAddress !== "127.0.0.1" &&
+    request.socket.remoteAddress !== "::1" &&
+    request.socket.remoteAddress !== "::ffff:127.0.0.1"
+  ) {
+    writeJsonResponse(response, 403, { error: "Forbidden" });
+    return;
+  }
+
+  const url = new URL(request.url ?? "/", `http://${oakConfig.apiHost}`);
+  const method = request.method ?? "GET";
+  const parts = url.pathname.split("/").filter(Boolean);
+
+  if (method === "GET" && url.pathname === "/healthz") {
+    writeJsonResponse(response, 200, { ok: true });
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/workspaces") {
+    writeJsonResponse(response, 200, {
+      workspaces: oakAccessConfigStore.listWorkspaces(),
+    });
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/config") {
+    writeJsonResponse(response, 200, getOakConfigSnapshot());
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/config/workspaces") {
+    const body = await readRequestJson(request);
+    const workspace = await oakAccessConfigStore.upsertWorkspace({
+      key: requireStringField(body, "key"),
+      root: requireStringField(body, "root"),
+    });
+    writeJsonResponse(response, 200, { workspace });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/config/workspaces/remove") {
+    const body = await readRequestJson(request);
+    const key = requireStringField(body, "key");
+    await oakAccessConfigStore.removeWorkspace(key);
+    writeJsonResponse(response, 200, { ok: true });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/config/routes") {
+    const body = await readRequestJson(request);
+    const route = await oakAccessConfigStore.upsertRoute({
+      guildId: requireStringField(body, "guildId"),
+      channelId: optionalStringField(body, "channelId"),
+      workspaceKey: requireStringField(body, "workspaceKey"),
+    });
+    writeJsonResponse(response, 200, { route });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/config/routes/clear") {
+    const body = await readRequestJson(request);
+    await oakAccessConfigStore.clearRoute({
+      guildId: requireStringField(body, "guildId"),
+      channelId: optionalStringField(body, "channelId"),
+    });
+    writeJsonResponse(response, 200, { ok: true });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/config/access/grant") {
+    const body = await readRequestJson(request);
+    const workspace = await oakAccessConfigStore.grantWorkspaceAccess(
+      requireStringField(body, "workspaceKey"),
+      requireStringField(body, "userId"),
+    );
+    writeJsonResponse(response, 200, { workspace });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/config/access/revoke") {
+    const body = await readRequestJson(request);
+    const workspace = await oakAccessConfigStore.revokeWorkspaceAccess(
+      requireStringField(body, "workspaceKey"),
+      requireStringField(body, "userId"),
+    );
+    writeJsonResponse(response, 200, { workspace });
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/discord/guilds") {
+    writeJsonResponse(response, 200, {
+      guilds: discordClient.guilds.cache.map((guild) => ({
+        id: guild.id,
+        name: guild.name,
+        memberCount: guild.memberCount,
+        ownerId: guild.ownerId,
+      })),
+    });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/discord/script") {
+    const body = await readRequestJson(request);
+    const result = await runDiscordAdminScript(
+      discordClient,
+      requireStringField(body, "code"),
+    );
+    writeJsonResponse(response, 200, { result });
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/sessions") {
+    writeJsonResponse(response, 200, {
+      sessions: sessionStore.list().map(serializeSession),
+    });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/threads") {
+    const body = await readRequestJson(request);
+    const { session, subscription } = await createApiThread(discordClient, body);
+    writeJsonResponse(response, 200, {
+      session: serializeSession(session),
+      subscription,
+    });
+    return;
+  }
+
+  if (parts[0] === "sessions" && parts[1]) {
+    const session = await getApiSession(discordClient, parts[1]);
+    if (method === "GET" && parts.length === 2) {
+      writeJsonResponse(response, 200, { session: serializeSession(session) });
+      return;
+    }
+    if (method === "GET" && parts[2] === "last-message") {
+      writeJsonResponse(response, 200, {
+        text: session.record.lastAssistantResponse,
+      });
+      return;
+    }
+    if (method === "GET" && parts[2] === "context") {
+      writeJsonResponse(response, 200, {
+        text: formatContextUsage(session.record),
+        tokenUsage: session.record.tokenUsage,
+      });
+      return;
+    }
+    if (method === "POST" && parts[2] === "message") {
+      const body = await readRequestJson(request);
+      const dispatch = await dispatchTextToSession(
+        session,
+        requireStringField(body, "message"),
+        null,
+      );
+      writeJsonResponse(response, 200, {
+        dispatch,
+        session: serializeSession(session),
+      });
+      return;
+    }
+    if (method === "POST" && parts[2] === "compact") {
+      await ensureSessionReady(session);
+      await requestSessionCompaction(session);
+      writeJsonResponse(response, 200, {
+        ok: true,
+        session: serializeSession(session),
+      });
+      return;
+    }
+    if (method === "POST" && parts[2] === "interrupt") {
+      await ensureSessionReady(session);
+      const turnId = await session.client.interruptTurn();
+      session.interruptingTurnId = turnId;
+      setTyping(session, false);
+      writeJsonResponse(response, 200, { turnId });
+      return;
+    }
+  }
+
+  if (
+    method === "POST" &&
+    parts[0] === "superagents" &&
+    parts[1] &&
+    parts[2] === "message"
+  ) {
+    const body = await readRequestJson(request);
+    const session =
+      parts[1] === OAK_ADMIN_WORKSPACE_KEY
+        ? await getOrCreateAdminDmSuperagentSession(discordClient)
+        : await (async () => {
+            const workspace = oakAccessConfigStore.getWorkspace(parts[1] ?? "");
+            if (!workspace) {
+              throw new Error(`Unknown workspace: ${parts[1]}`);
+            }
+            return await getOrCreateSuperagentSession(
+              discordClient,
+              workspace,
+              null,
+            );
+          })();
+    const dispatch = await dispatchTextToSession(
+      session,
+      requireStringField(body, "message"),
+      null,
+    );
+    writeJsonResponse(response, 200, {
+      dispatch,
+      session: serializeSession(session),
+    });
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/subscriptions") {
+    const body = await readRequestJson(request);
+    const workspaceKey = requireStringField(body, "workspace");
+    const workspace = getSuperagentWorkspace(workspaceKey);
+    if (!workspace) {
+      throw new Error(`Unknown workspace: ${workspaceKey}`);
+    }
+    const superagent = superagentStore.getSuperagent(workspace.key);
+    if (!superagent) {
+      throw new Error(
+        `Superagent does not exist for workspace: ${workspace.key}`,
+      );
+    }
+    const subscription = await superagentStore.subscribe({
+      workspaceKey: workspace.key,
+      superagentDiscordThreadId: superagent.discordThreadId,
+      targetDiscordThreadId: optionalStringField(body, "discordThreadId"),
+      targetCodexThreadId: optionalStringField(body, "codexThreadId"),
+    });
+    writeJsonResponse(response, 200, { subscription });
+    return;
+  }
+
+  writeJsonResponse(response, 404, { error: "Not found" });
+}
+
+function startOakApiServer(discordClient: Client): void {
+  const server = createServer((request, response) => {
+    void handleOakApiRequest(discordClient, request, response).catch(
+      (error) => {
+        writeJsonResponse(response, 500, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+  });
+
+  server.listen(oakConfig.apiPort, oakConfig.apiHost, () => {
+    log("Oak local API listening", {
+      url: `http://${oakConfig.apiHost}:${oakConfig.apiPort}`,
+    });
+  });
+}
+
 async function runDryCheck(): Promise<void> {
   if (!oakConfig.codexWsUrl) {
     throw new Error("OAK_CODEX_WS_URL is not configured.");
@@ -4357,6 +5746,7 @@ export async function main(): Promise<void> {
   await mkdir(oakConfig.runtimeDir, { recursive: true });
   await oakAccessConfigStore.load();
   await sessionStore.load();
+  await superagentStore.load();
 
   if (oakConfig.dryRun) {
     await runDryCheck();
@@ -4371,9 +5761,13 @@ export async function main(): Promise<void> {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages,
       GatewayIntentBits.MessageContent,
     ],
+    partials: [Partials.Channel, Partials.Message],
   });
+
+  startOakApiServer(client);
 
   client.once(Events.ClientReady, (readyClient) => {
     log("Discord client ready", {
@@ -4407,6 +5801,15 @@ export async function main(): Promise<void> {
   });
 
   client.on(Events.MessageCreate, (message) => {
+    if (!message.inGuild()) {
+      log("Received non-guild messageCreate", {
+        userId: message.author?.id ?? null,
+        channelId: message.channelId,
+        channelType: message.channel?.type ?? null,
+        messageType: message.type,
+        partial: message.partial,
+      });
+    }
     void handleMessage(message, client.user?.id ?? "").catch((error) => {
       console.error("[oak] Message handler failed:", error);
       if (message.channel.isThread()) {
@@ -4417,6 +5820,31 @@ export async function main(): Promise<void> {
         ).catch(() => {});
       }
     });
+  });
+
+  client.on("raw", (packet) => {
+    if (
+      packet.t === "MESSAGE_CREATE" &&
+      typeof packet.d === "object" &&
+      packet.d !== null &&
+      !("guild_id" in packet.d)
+    ) {
+      const data = packet.d as {
+        author?: { id?: string };
+        channel_id?: string;
+        type?: number;
+      };
+      log("Received raw DM MESSAGE_CREATE", {
+        userId: data.author?.id ?? null,
+        channelId: data.channel_id ?? null,
+        type: data.type ?? null,
+      });
+      void handleRawDmMessage(client, packet.d as Parameters<typeof handleRawDmMessage>[1]).catch(
+        (error) => {
+          console.error("[oak] Raw DM handler failed:", error);
+        },
+      );
+    }
   });
 
   client.on(Events.InteractionCreate, (interaction) => {

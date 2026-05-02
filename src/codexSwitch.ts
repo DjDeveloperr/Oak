@@ -151,7 +151,7 @@ async function pushCodexProfileChanges(changedPaths: string[]): Promise<void> {
   }
 
   try {
-    await runSerializedGitCommand(["add", "--", ...repoPaths]);
+    await runSerializedGitCommand(["add", "-f", "--", ...repoPaths]);
     await runSerializedGitCommand(["commit", "-m", "update", "--", ...repoPaths]);
     await runSerializedGitCommand(["push"]);
   } catch (error) {

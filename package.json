@@ -4,6 +4,9 @@
   "private": true,
   "description": "Discord bot that runs OpenAI Codex through the Codex app-server.",
   "type": "module",
+  "bin": {
+    "oak-api": "./dist/src/oakCli.js"
+  },
   "scripts": {
     "clean": "rm -rf dist",
     "build": "swc src -d dist --config-file ./.swcrc",

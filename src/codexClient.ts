@@ -21,6 +21,15 @@ export type OakUserInput =
   | OakUserImageInput
   | OakUserLocalImageInput;
 
+export interface OakTokenUsage {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  modelContextWindow: number | null;
+}
+
 export type OakCodexEvent =
   | { type: "thread_started"; threadId: string }
   | { type: "thread_status_changed"; threadId: string; status: string }
@@ -33,6 +42,13 @@ export type OakCodexEvent =
       reason: string;
     }
   | { type: "reasoning"; threadId: string; turnId: string; text: string }
+  | {
+      type: "token_usage";
+      threadId: string;
+      turnId: string | null;
+      usage: OakTokenUsage;
+    }
+  | { type: "context_compaction"; threadId: string; turnId: string | null }
   | {
       type: "command_execution";
       threadId: string;
@@ -101,6 +117,8 @@ export interface OakThreadMetadata {
   name: string | null;
   status: string | null;
   activeTurnId: string | null;
+  lastAssistantResponse: string | null;
+  contextCompactionCount: number;
 }
 
 const OAK_CODEX_CLIENT_NAME = "oak-codex-discord-bot";
@@ -112,7 +130,6 @@ const OAK_CODEX_OPT_OUT_NOTIFICATION_METHODS = [
   "thread/closed",
   "skills/changed",
   "thread/name/updated",
-  "thread/tokenUsage/updated",
   "hook/started",
   "hook/completed",
   "turn/diff/updated",
@@ -135,15 +152,19 @@ const OAK_CODEX_OPT_OUT_NOTIFICATION_METHODS = [
   "item/reasoning/summaryTextDelta",
   "item/reasoning/summaryPartAdded",
   "item/reasoning/textDelta",
-  "thread/compacted",
   "model/rerouted",
+  "model/verification",
+  "warning",
+  "guardianWarning",
   "deprecationNotice",
   "configWarning",
   "fuzzyFileSearch/sessionUpdated",
   "fuzzyFileSearch/sessionCompleted",
   "thread/realtime/started",
   "thread/realtime/itemAdded",
-  "thread/realtime/transcriptUpdated",
+  "thread/realtime/transcript/delta",
+  "thread/realtime/transcript/done",
+  "thread/realtime/sdp",
   "thread/realtime/outputAudio/delta",
   "thread/realtime/error",
   "thread/realtime/closed",
@@ -158,6 +179,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function asBoolean(value: unknown): boolean | null {
@@ -364,6 +389,66 @@ function extractAssistantMessage(item: Record<string, unknown>): {
   return { text, phase };
 }
 
+function extractAssistantMessageFromThread(
+  thread: Record<string, unknown>,
+): string | null {
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  for (const turn of [...turns].reverse()) {
+    if (!isRecord(turn) || !Array.isArray(turn.items)) {
+      continue;
+    }
+    for (const item of [...turn.items].reverse()) {
+      if (!isRecord(item) || item.type !== "agentMessage") {
+        continue;
+      }
+      const phase = asString(item.phase);
+      const text = asString(item.text);
+      if (text && (!phase || phase === "final_answer")) {
+        return text;
+      }
+    }
+  }
+  return null;
+}
+
+function countContextCompactionItems(thread: Record<string, unknown>): number {
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  let count = 0;
+  for (const turn of turns) {
+    if (!isRecord(turn) || !Array.isArray(turn.items)) {
+      continue;
+    }
+    count += turn.items.filter(
+      (item) => isRecord(item) && item.type === "contextCompaction",
+    ).length;
+  }
+  return count;
+}
+
+function extractTokenUsage(value: unknown): OakTokenUsage | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const total = isRecord(value.total) ? value.total : null;
+  if (!total) {
+    return null;
+  }
+
+  const totalTokens = asNumber(total.totalTokens);
+  if (totalTokens == null) {
+    return null;
+  }
+
+  return {
+    totalTokens,
+    inputTokens: asNumber(total.inputTokens) ?? 0,
+    cachedInputTokens: asNumber(total.cachedInputTokens) ?? 0,
+    outputTokens: asNumber(total.outputTokens) ?? 0,
+    reasoningOutputTokens: asNumber(total.reasoningOutputTokens) ?? 0,
+    modelContextWindow: asNumber(value.modelContextWindow),
+  };
+}
+
 function extractThreadStatus(value: unknown): string | null {
   if (!isRecord(value)) {
     return null;
@@ -499,8 +584,7 @@ export class OakCodexClient {
       15000,
     );
 
-    const threadId =
-      extractThreadId(result) ?? (await this.waitForThreadId(2000));
+    const threadId = extractThreadId(result);
     if (!threadId) {
       throw new Error(
         "codex_protocol_error: thread/start did not return a thread id",
@@ -579,6 +663,7 @@ export class OakCodexClient {
           "thread/read",
           {
             threadId: this.threadId,
+            includeTurns: true,
           },
           15000,
         );
@@ -611,7 +696,23 @@ export class OakCodexClient {
       name: asString(thread.name),
       status: extractThreadStatus(result) ?? extractThreadStatus(thread),
       activeTurnId: extractTurnId(result) ?? extractTurnId(thread),
+      lastAssistantResponse: extractAssistantMessageFromThread(thread),
+      contextCompactionCount: countContextCompactionItems(thread),
     };
+  }
+
+  async compactThread(): Promise<void> {
+    if (!this.threadId) {
+      throw new Error("codex_thread_not_started");
+    }
+
+    await this.request(
+      "thread/compact/start",
+      {
+        threadId: this.threadId,
+      },
+      15000,
+    );
   }
 
   async listModels(): Promise<OakCodexModelOption[]> {
@@ -1024,7 +1125,6 @@ export class OakCodexClient {
     if (method === "thread/started") {
       const threadId = extractThreadId(params);
       if (threadId) {
-        this.threadId = threadId;
         this.options.onEvent({ type: "thread_started", threadId });
       }
       return;
@@ -1049,6 +1149,37 @@ export class OakCodexClient {
       if (status === "idle" && (this.currentTurn || this.resumedTurnActive)) {
         this.finishCurrentTurn(this.activeTurnId, null, false);
       }
+      return;
+    }
+
+    if (method === "thread/tokenUsage/updated") {
+      const threadId = this.resolveNotificationThreadId(params);
+      if (!threadId) {
+        return;
+      }
+      const usage = extractTokenUsage(params.tokenUsage);
+      if (!usage) {
+        return;
+      }
+      this.options.onEvent({
+        type: "token_usage",
+        threadId,
+        turnId: asString(params.turnId),
+        usage,
+      });
+      return;
+    }
+
+    if (method === "thread/compacted") {
+      const threadId = this.resolveNotificationThreadId(params);
+      if (!threadId) {
+        return;
+      }
+      this.options.onEvent({
+        type: "context_compaction",
+        threadId,
+        turnId: asString(params.turnId),
+      });
       return;
     }
 
@@ -1189,6 +1320,15 @@ export class OakCodexClient {
       return;
     }
 
+    if (item.type === "contextCompaction") {
+      this.options.onEvent({
+        type: "context_compaction",
+        threadId,
+        turnId,
+      });
+      return;
+    }
+
     if (item.type === "commandExecution" && typeof item.command === "string") {
       return;
     }
@@ -1285,6 +1425,39 @@ export class OakCodexClient {
           new Error(
             "codex_user_input_required: requestUserInput is unsupported",
           ),
+        );
+        return;
+      case "mcpServer/elicitation/request":
+        this.respond(requestId, {
+          action: "cancel",
+          content: null,
+          _meta: null,
+        });
+        this.currentTurn?.reject(
+          new Error("codex_elicitation_request: elicitation is unsupported"),
+        );
+        return;
+      case "item/tool/call":
+        this.respond(requestId, {
+          contentItems: [
+            {
+              type: "inputText",
+              text: "Oak does not support dynamic app-server tool calls.",
+            },
+          ],
+          success: false,
+        });
+        this.currentTurn?.reject(
+          new Error("codex_dynamic_tool_call: tool calls are unsupported"),
+        );
+        return;
+      case "account/chatgptAuthTokens/refresh":
+        this.respondError(
+          requestId,
+          "Oak does not provide ChatGPT auth token refresh.",
+        );
+        this.currentTurn?.reject(
+          new Error("codex_auth_refresh_request: unsupported"),
         );
         return;
       case "item/permissions/requestApproval":
@@ -1425,17 +1598,6 @@ export class OakCodexClient {
         },
       }),
     );
-  }
-
-  private async waitForThreadId(timeoutMs: number): Promise<string | null> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (this.threadId) {
-        return this.threadId;
-      }
-      await delay(50);
-    }
-    return this.threadId;
   }
 
   private async waitForTurnId(timeoutMs: number): Promise<string | null> {

@@ -6,6 +6,7 @@ oak/.runtime
 .env.*
 !.env.example
 .codex
+OAK_MEMORY.md
 .DS_Store
 *.log
 npm-debug.log*

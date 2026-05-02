@@ -48,6 +48,8 @@ Optional Codex defaults:
 - `OAK_CODEX_SERVICE_TIER`
 - `OAK_TURN_TIMEOUT_MS`
 - `OAK_TYPING_INTERVAL_MS`
+- `OAK_API_HOST`
+- `OAK_API_PORT`
 
 Optional first-run bootstrap:
 
@@ -78,6 +80,7 @@ Start a session:
 - Mention the bot in a routed text channel to create a thread-backed session
 - In an Oak thread, send a normal message to continue the session
 - In an uninitialized thread, mention the bot once to start session state
+- DM Oak as the configured `OAK_OWNER_ID` user to use the owner-only admin Superagent rooted at `~/.oak`
 
 Mention commands:
 
@@ -86,6 +89,9 @@ Mention commands:
 - `stop` or `cancel` inside an Oak thread
 - `@Oak rate limits`
 - `@Oak codex switch`
+- `@Oak context`
+- `@Oak compact`
+- `@Oak restart`
 - `@Oak restart bot`
 - `@Oak restart codex`
 
@@ -120,3 +126,11 @@ npm run dry
 ```
 
 `npm run dry` checks that Oak can connect to the configured app-server without logging into Discord.
+
+The local automation CLI is available after build:
+
+```bash
+oak-api thread --workspace <key> --prompt "Do the task" --subscribe
+oak-api thread --workspace <key> --prompt "Do the task" --subscribe --subscribe-workspace oak-admin
+oak-api wait <discord-thread-id>
+```

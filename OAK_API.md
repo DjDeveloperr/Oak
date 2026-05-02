@@ -1,0 +1,307 @@
+# Oak Local API
+
+Oak exposes a loopback-only HTTP API from the bot process. It is intended for local automation and for Oak Superagent threads that need to create, steer, compact, or subscribe to other Oak/Codex threads.
+
+Default base URL:
+
+```text
+http://127.0.0.1:4788
+```
+
+The CLI wrapper is `oak-api` after `npm run build`. During development, run it with:
+
+```bash
+node dist/src/oakCli.js <command>
+```
+
+## Concepts
+
+- A workspace is Oak's routed workspace config.
+- A session is one Discord thread mapped to one Codex thread.
+- A Superagent is one long-lived session per workspace. Messages prefixed with `--` in a routed Discord channel are sent to that workspace's Superagent. If it does not exist, Oak creates it.
+- The owner can DM Oak directly to use an owner-only admin Superagent rooted at `~/.oak`.
+- A subscription asks Oak to notify the workspace Superagent when a target session completes. If the Superagent is working, Oak steers the update into its active turn. Otherwise Oak starts a new Superagent turn with the update.
+
+## CLI
+
+List workspaces:
+
+```bash
+oak-api workspaces
+```
+
+List sessions:
+
+```bash
+oak-api sessions
+```
+
+Create a new Oak thread and start a Codex turn:
+
+```bash
+oak-api thread --workspace <workspace-key> --prompt "Do the task" --name "Optional thread name" --subscribe
+```
+
+Use `--subscribe-workspace oak-admin` when an owner DM Superagent dispatches work to another workspace and should receive the completion update itself.
+
+Send a message to an existing Oak session. Oak steers if the session is working, otherwise it starts a new turn:
+
+```bash
+oak-api message <discord-thread-id> "Continue with this instruction"
+```
+
+Send a message to a workspace Superagent:
+
+```bash
+oak-api superagent <workspace-key> "Coordinate this work"
+```
+
+The owner-only DM Superagent is addressed as workspace `oak-admin`:
+
+```bash
+oak-api superagent oak-admin "List the guilds Oak is in"
+```
+
+Subscribe the workspace Superagent to a spawned thread:
+
+```bash
+oak-api subscribe <workspace-key> --discord-thread <discord-thread-id>
+oak-api subscribe <workspace-key> --codex-thread <codex-thread-id>
+```
+
+Create a thread and wait for completion:
+
+```bash
+oak-api thread --workspace <workspace-key> --prompt "Do the task" --subscribe
+oak-api wait <discord-thread-id>
+```
+
+Inspect context usage:
+
+```bash
+oak-api context <discord-thread-id>
+```
+
+Manually compact context:
+
+```bash
+oak-api compact <discord-thread-id>
+```
+
+Interrupt a running turn:
+
+```bash
+oak-api interrupt <discord-thread-id>
+```
+
+Fetch the last Oak final answer:
+
+```bash
+oak-api last <discord-thread-id>
+```
+
+Raw HTTP helpers:
+
+```bash
+oak-api get /sessions
+oak-api post /sessions/<discord-thread-id>/message '{"message":"hi"}'
+```
+
+Admin configuration and Discord helpers:
+
+```bash
+oak-api get /config
+oak-api post /config/workspaces '{"key":"app","root":"/home/ubuntu/apps/App"}'
+oak-api post /config/routes '{"guildId":"123","channelId":"456","workspaceKey":"app"}'
+oak-api post /config/access/grant '{"workspaceKey":"app","userId":"789"}'
+oak-api get /discord/guilds
+oak-api post /discord/script '{"code":"return client.guilds.cache.map(g => ({ id: g.id, name: g.name }));"}'
+```
+
+## HTTP Endpoints
+
+`GET /healthz`
+
+Returns API health.
+
+`GET /workspaces`
+
+Returns configured workspaces.
+
+`GET /config`
+
+Returns the full Oak configuration snapshot: workspaces, routes, Superagents, and serialized sessions.
+
+`POST /config/workspaces`
+
+Creates or updates a workspace.
+
+Body:
+
+```json
+{ "key": "app", "root": "/home/ubuntu/apps/App" }
+```
+
+`POST /config/workspaces/remove`
+
+Removes an unused workspace.
+
+Body:
+
+```json
+{ "key": "app" }
+```
+
+`POST /config/routes`
+
+Creates or updates a guild or channel route.
+
+Body:
+
+```json
+{ "guildId": "123", "channelId": "456 or null", "workspaceKey": "app" }
+```
+
+`POST /config/routes/clear`
+
+Clears a guild or channel route.
+
+Body:
+
+```json
+{ "guildId": "123", "channelId": "456 or null" }
+```
+
+`POST /config/access/grant`
+
+Grants workspace access to a Discord user id.
+
+Body:
+
+```json
+{ "workspaceKey": "app", "userId": "789" }
+```
+
+`POST /config/access/revoke`
+
+Revokes workspace access from a Discord user id.
+
+Body:
+
+```json
+{ "workspaceKey": "app", "userId": "789" }
+```
+
+`GET /discord/guilds`
+
+Returns basic guilds visible to the Oak bot.
+
+`POST /discord/script`
+
+Runs owner-intended JavaScript inside the Oak bot process with `client`, `discord`, and `oak` in scope. This is loopback-only and intended for the owner-only DM Superagent.
+
+Body:
+
+```json
+{
+  "code": "return client.guilds.cache.map(g => ({ id: g.id, name: g.name }));"
+}
+```
+
+`GET /sessions`
+
+Returns persisted Oak sessions.
+
+`POST /threads`
+
+Creates a new Discord thread in a workspace route and creates/resumes the Codex thread for it.
+
+Body:
+
+```json
+{
+  "workspace": "default",
+  "prompt": "Task prompt",
+  "name": "Optional Discord thread name",
+  "channelId": "Optional routed text channel id",
+  "subscribe": "Optional boolean; subscribe the workspace Superagent to completion",
+  "subscribeWorkspace": "Optional workspace key whose Superagent receives completion, e.g. oak-admin"
+}
+```
+
+`GET /sessions/:discordThreadId`
+
+Returns one session.
+
+`POST /sessions/:discordThreadId/message`
+
+Steers the active turn if one is running, otherwise starts a new turn.
+
+Body:
+
+```json
+{ "message": "Instruction text" }
+```
+
+`GET /sessions/:discordThreadId/last-message`
+
+Returns Oak's last final answer for the session.
+
+`GET /sessions/:discordThreadId/context`
+
+Returns the most recent app-server token usage and the percentage of context used when the model context window is known.
+
+`POST /sessions/:discordThreadId/compact`
+
+Triggers `thread/compact/start` for that Codex thread.
+
+`POST /sessions/:discordThreadId/interrupt`
+
+Sends `turn/interrupt` for the active turn.
+
+`POST /superagents/:workspace/message`
+
+Creates or reuses the workspace Superagent and sends it a message.
+
+Body:
+
+```json
+{ "message": "Coordination prompt" }
+```
+
+`POST /subscriptions`
+
+Subscribes the workspace Superagent to a session completion. `oak-admin` is accepted for the owner-only DM Superagent.
+
+Body:
+
+```json
+{
+  "workspace": "default",
+  "discordThreadId": "Optional Discord thread id",
+  "codexThreadId": "Optional Codex thread id"
+}
+```
+
+At least one target id is required.
+
+## Superagent Memory
+
+Superagents should maintain durable workspace notes in `OAK_MEMORY.md`. Keep it concise, stable, and actionable. Oak gitignores `OAK_MEMORY.md` in this repo.
+
+## App-Server Notes
+
+Oak uses Codex app-server JSON-RPC over a local WebSocket. Current protocol support in Oak includes:
+
+- `thread/start`
+- `thread/resume`
+- `thread/read`
+- `thread/name/set`
+- `thread/archive`
+- `thread/compact/start`
+- `turn/start`
+- `turn/steer`
+- `turn/interrupt`
+- `model/list`
+- `thread/tokenUsage/updated`
+- `thread/compacted` and `contextCompaction` item notifications

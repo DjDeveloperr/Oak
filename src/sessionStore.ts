@@ -25,6 +25,20 @@ export interface OakTokenUsageRecord {
   updatedAt: string;
 }
 
+export type OakGoalStatus = "active" | "paused" | "budgetLimited" | "complete";
+
+export interface OakGoalRecord {
+  threadId: string;
+  objective: string;
+  status: OakGoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+  syncedAt: string;
+}
+
 export type OakCompactionStatus = "idle" | "running" | "requested" | "failed";
 
 export interface SessionRecord extends OakThreadPreferences {
@@ -53,6 +67,7 @@ export interface SessionRecord extends OakThreadPreferences {
   rolloutReadOffset: number;
   lastAssistantResponse: string | null;
   tokenUsage: OakTokenUsageRecord | null;
+  goal: OakGoalRecord | null;
   lastCodexOutputKind:
     | "reasoning"
     | "command_execution"
@@ -177,6 +192,59 @@ function normalizeTokenUsage(
   };
 }
 
+function normalizeGoal(
+  value: OakGoalRecord | null | undefined,
+): OakGoalRecord | null {
+  if (
+    !value ||
+    typeof value.objective !== "string" ||
+    !value.objective.trim()
+  ) {
+    return null;
+  }
+  if (
+    value.status !== "active" &&
+    value.status !== "paused" &&
+    value.status !== "budgetLimited" &&
+    value.status !== "complete"
+  ) {
+    return null;
+  }
+
+  return {
+    threadId:
+      typeof value.threadId === "string" && value.threadId.trim()
+        ? value.threadId
+        : "",
+    objective: value.objective.trim(),
+    status: value.status,
+    tokenBudget:
+      typeof value.tokenBudget === "number" &&
+      Number.isFinite(value.tokenBudget) &&
+      value.tokenBudget > 0
+        ? value.tokenBudget
+        : null,
+    tokensUsed:
+      typeof value.tokensUsed === "number" ? Math.max(0, value.tokensUsed) : 0,
+    timeUsedSeconds:
+      typeof value.timeUsedSeconds === "number"
+        ? Math.max(0, value.timeUsedSeconds)
+        : 0,
+    createdAt:
+      typeof value.createdAt === "number" && Number.isFinite(value.createdAt)
+        ? value.createdAt
+        : 0,
+    updatedAt:
+      typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt)
+        ? value.updatedAt
+        : 0,
+    syncedAt:
+      typeof value.syncedAt === "string" && value.syncedAt.trim()
+        ? value.syncedAt
+        : new Date(0).toISOString(),
+  };
+}
+
 function normalizeCompactionStatus(
   value: OakCompactionStatus | null | undefined,
 ): OakCompactionStatus {
@@ -263,6 +331,7 @@ export class SessionStore {
               ? record.lastAssistantResponse
               : null,
           tokenUsage: normalizeTokenUsage(record.tokenUsage),
+          goal: normalizeGoal(record.goal),
           lastCodexOutputKind:
             record.lastCodexOutputKind === "reasoning" ||
             record.lastCodexOutputKind === "command_execution" ||

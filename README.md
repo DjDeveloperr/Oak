@@ -92,6 +92,9 @@ Mention commands:
 - `@Oak codex switch`
 - `@Oak context`
 - `@Oak compact`
+- `@Oak goal`
+- `@Oak goal <objective>`
+- `@Oak goal clear`
 - `@Oak restart`
 - `@Oak restart bot`
 - `@Oak restart codex`

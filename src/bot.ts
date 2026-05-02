@@ -43,6 +43,7 @@ import {
   OakCodexClient,
   type OakCodexEvent,
   type OakCodexModelOption,
+  type OakThreadGoal,
   type OakTokenUsage,
   type OakUserInput,
 } from "./codexClient.js";
@@ -75,6 +76,7 @@ import {
 } from "./applicationCommands.js";
 import {
   SessionStore,
+  type OakGoalRecord,
   type OakTrackedAgentRecord,
   type OakTokenUsageRecord,
   type SessionRecord,
@@ -1126,6 +1128,34 @@ function buildTokenUsageRecord(usage: OakTokenUsage): OakTokenUsageRecord {
   };
 }
 
+function buildGoalRecord(goal: OakThreadGoal): OakGoalRecord {
+  return {
+    threadId: goal.threadId,
+    objective: goal.objective,
+    status: goal.status,
+    tokenBudget: goal.tokenBudget,
+    tokensUsed: goal.tokensUsed,
+    timeUsedSeconds: goal.timeUsedSeconds,
+    createdAt: goal.createdAt,
+    updatedAt: goal.updatedAt,
+    syncedAt: new Date().toISOString(),
+  };
+}
+
+function formatGoal(goal: OakGoalRecord | null): string {
+  if (!goal) {
+    return "No goal is set for this thread.";
+  }
+
+  const lines = [
+    `Goal: ${goal.objective}`,
+    `Status: \`${goal.status}\``,
+    `Tokens: \`${goal.tokensUsed.toLocaleString()}\`${goal.tokenBudget ? ` / \`${goal.tokenBudget.toLocaleString()}\`` : ""}`,
+    `Time used: \`${Math.round(goal.timeUsedSeconds).toLocaleString()}s\``,
+  ];
+  return lines.join("\n");
+}
+
 function formatContextUsage(record: SessionRecord): string {
   const usage = record.tokenUsage;
   if (!usage) {
@@ -1508,6 +1538,18 @@ async function setSessionCompactionStatus(
     compactionStatus: status,
     compactionUpdatedAt: new Date().toISOString(),
     compactionFailureReason: failureReason,
+    updatedAt: new Date().toISOString(),
+  };
+  await persistSession(session);
+}
+
+async function setSessionGoal(
+  session: SessionContext,
+  goal: OakThreadGoal | null,
+): Promise<void> {
+  session.record = {
+    ...session.record,
+    goal: goal ? buildGoalRecord(goal) : null,
     updatedAt: new Date().toISOString(),
   };
   await persistSession(session);
@@ -2108,6 +2150,12 @@ async function handleSessionEvent(
         updatedAt: new Date().toISOString(),
       };
       await persistSession(session);
+      return;
+    case "goal_updated":
+      await setSessionGoal(session, event.goal);
+      return;
+    case "goal_cleared":
+      await setSessionGoal(session, null);
       return;
     case "context_compaction":
       await setSessionCompactionStatus(session, "requested");
@@ -2910,6 +2958,7 @@ async function createFreshSession(
       rolloutReadOffset: 0,
       lastAssistantResponse: null,
       tokenUsage: null,
+      goal: null,
       lastCodexOutputKind: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -3996,6 +4045,55 @@ async function handleContextCommand(
 
   await message.reply("Compacting context.");
   await requestSessionCompaction(session);
+  return true;
+}
+
+async function handleGoalCommand(
+  message: Message,
+  botUserId: string,
+): Promise<boolean> {
+  const command = getMentionCommandText(message, botUserId);
+  if (!command || (command !== "goal" && !command.startsWith("goal "))) {
+    return false;
+  }
+
+  if (!message.channel.isThread()) {
+    await message.reply("This command only works inside an Oak thread.");
+    return true;
+  }
+
+  const session = await getOrCreateSession(message.channel);
+  if (!session) {
+    await message.reply("This thread is not linked to an Oak session.");
+    return true;
+  }
+
+  await ensureSessionReady(session);
+  const value = command.slice("goal".length).trim();
+
+  try {
+    if (!value) {
+      const goal = await session.client.getGoal();
+      await setSessionGoal(session, goal);
+      await message.reply(formatGoal(session.record.goal));
+      return true;
+    }
+
+    if (value === "clear") {
+      await session.client.clearGoal();
+      await setSessionGoal(session, null);
+      await message.reply("Cleared this thread's goal.");
+      return true;
+    }
+
+    const goal = await session.client.setGoal(value, null);
+    if (goal) {
+      await setSessionGoal(session, goal);
+    }
+    await message.reply(formatGoal(session.record.goal));
+  } catch (error) {
+    await message.reply(error instanceof Error ? error.message : String(error));
+  }
   return true;
 }
 
@@ -5247,6 +5345,10 @@ async function handleMessage(
     return;
   }
 
+  if (await handleGoalCommand(message, botUserId)) {
+    return;
+  }
+
   if (await handleModelCommand(message, botUserId)) {
     return;
   }
@@ -5404,6 +5506,26 @@ function optionalBooleanValue(
   return undefined;
 }
 
+function optionalPositiveNumberField(
+  body: unknown,
+  field: string,
+): number | null {
+  if (typeof body !== "object" || body === null) {
+    return null;
+  }
+  const value = (body as Record<string, unknown>)[field];
+  if (value == null) {
+    return null;
+  }
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function requireBooleanField(body: unknown, field: string): boolean {
   const value = optionalBooleanValue(body, field);
   if (typeof value === "boolean") {
@@ -5486,6 +5608,7 @@ function serializeSession(session: SessionContext | SessionRecord) {
     compactionFailureReason: record.compactionFailureReason,
     lastAssistantResponse: record.lastAssistantResponse,
     tokenUsage: record.tokenUsage,
+    goal: record.goal,
     updatedAt: record.updatedAt,
   };
 }
@@ -5775,6 +5898,39 @@ async function handleOakApiRequest(
         tokenUsage: session.record.tokenUsage,
       });
       return;
+    }
+    if (parts[2] === "goal") {
+      await ensureSessionReady(session);
+      if (method === "GET") {
+        const goal = await session.client.getGoal();
+        await setSessionGoal(session, goal);
+        writeJsonResponse(response, 200, {
+          text: formatGoal(session.record.goal),
+          goal: session.record.goal,
+        });
+        return;
+      }
+      if (method === "POST") {
+        const body = await readRequestJson(request);
+        const goal = await session.client.setGoal(
+          requireStringField(body, "objective"),
+          optionalPositiveNumberField(body, "tokenBudget"),
+        );
+        if (goal) {
+          await setSessionGoal(session, goal);
+        }
+        writeJsonResponse(response, 200, {
+          text: formatGoal(session.record.goal),
+          goal: session.record.goal,
+        });
+        return;
+      }
+      if (method === "DELETE") {
+        await session.client.clearGoal();
+        await setSessionGoal(session, null);
+        writeJsonResponse(response, 200, { ok: true, goal: null });
+        return;
+      }
     }
     if (method === "POST" && parts[2] === "message") {
       const body = await readRequestJson(request);

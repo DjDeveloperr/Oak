@@ -21,6 +21,9 @@ function usage(): never {
       "  oak-api subscribe <workspace> (--discord-thread <id> | --codex-thread <id>)",
       "  oak-api wait <discordThreadId> [--timeout-ms <ms>] [--interval-ms <ms>]",
       "  oak-api context <discordThreadId>",
+      "  oak-api goal get <discordThreadId>",
+      "  oak-api goal set <discordThreadId> <objective> [--token-budget <tokens>]",
+      "  oak-api goal clear <discordThreadId>",
       "  oak-api compact <discordThreadId>",
       "  oak-api interrupt <discordThreadId>",
       "  oak-api last <discordThreadId>",
@@ -250,6 +253,45 @@ async function main(): Promise<void> {
         : `/sessions/${threadId}/last-message`,
     );
     return;
+  }
+
+  if (command === "goal") {
+    const subcommand = args.shift();
+    if (subcommand === "get") {
+      const [threadId] = args;
+      if (!threadId || args.length !== 1) {
+        usage();
+      }
+      await request(`/sessions/${threadId}/goal`);
+      return;
+    }
+
+    if (subcommand === "set") {
+      const threadId = args.shift();
+      const tokenBudget = readFlag(args, "--token-budget");
+      if (!threadId || args.length === 0) {
+        usage();
+      }
+      await request(`/sessions/${threadId}/goal`, {
+        method: "POST",
+        body: JSON.stringify({
+          objective: args.join(" "),
+          tokenBudget,
+        }),
+      });
+      return;
+    }
+
+    if (subcommand === "clear") {
+      const [threadId] = args;
+      if (!threadId || args.length !== 1) {
+        usage();
+      }
+      await request(`/sessions/${threadId}/goal`, { method: "DELETE" });
+      return;
+    }
+
+    usage();
   }
 
   if (command === "wait") {

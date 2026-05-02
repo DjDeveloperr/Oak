@@ -30,6 +30,23 @@ export interface OakTokenUsage {
   modelContextWindow: number | null;
 }
 
+export type OakThreadGoalStatus =
+  | "active"
+  | "paused"
+  | "budgetLimited"
+  | "complete";
+
+export interface OakThreadGoal {
+  threadId: string;
+  objective: string;
+  status: OakThreadGoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type OakCodexEvent =
   | { type: "thread_started"; threadId: string }
   | { type: "thread_status_changed"; threadId: string; status: string }
@@ -48,6 +65,13 @@ export type OakCodexEvent =
       turnId: string | null;
       usage: OakTokenUsage;
     }
+  | {
+      type: "goal_updated";
+      threadId: string;
+      turnId: string | null;
+      goal: OakThreadGoal;
+    }
+  | { type: "goal_cleared"; threadId: string }
   | { type: "context_compaction"; threadId: string; turnId: string | null }
   | {
       type: "command_execution";
@@ -449,6 +473,38 @@ function extractTokenUsage(value: unknown): OakTokenUsage | null {
   };
 }
 
+function extractThreadGoal(value: unknown): OakThreadGoal | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const candidate = isRecord(value.goal) ? value.goal : value;
+  const threadId = asString(candidate.threadId);
+  const objective = asString(candidate.objective);
+  const status = asString(candidate.status);
+  if (
+    !threadId ||
+    !objective ||
+    (status !== "active" &&
+      status !== "paused" &&
+      status !== "budgetLimited" &&
+      status !== "complete")
+  ) {
+    return null;
+  }
+
+  return {
+    threadId,
+    objective,
+    status,
+    tokenBudget: asNumber(candidate.tokenBudget),
+    tokensUsed: asNumber(candidate.tokensUsed) ?? 0,
+    timeUsedSeconds: asNumber(candidate.timeUsedSeconds) ?? 0,
+    createdAt: asNumber(candidate.createdAt) ?? 0,
+    updatedAt: asNumber(candidate.updatedAt) ?? 0,
+  };
+}
+
 function extractThreadStatus(value: unknown): string | null {
   if (!isRecord(value)) {
     return null;
@@ -708,6 +764,55 @@ export class OakCodexClient {
 
     await this.request(
       "thread/compact/start",
+      {
+        threadId: this.threadId,
+      },
+      15000,
+    );
+  }
+
+  async getGoal(): Promise<OakThreadGoal | null> {
+    if (!this.threadId) {
+      throw new Error("codex_thread_not_started");
+    }
+
+    const result = await this.request(
+      "thread/goal/get",
+      {
+        threadId: this.threadId,
+      },
+      15000,
+    );
+    return extractThreadGoal(result);
+  }
+
+  async setGoal(
+    objective: string,
+    tokenBudget: number | null,
+  ): Promise<OakThreadGoal | null> {
+    if (!this.threadId) {
+      throw new Error("codex_thread_not_started");
+    }
+
+    const result = await this.request(
+      "thread/goal/set",
+      {
+        threadId: this.threadId,
+        objective,
+        tokenBudget,
+      },
+      15000,
+    );
+    return extractThreadGoal(result);
+  }
+
+  async clearGoal(): Promise<void> {
+    if (!this.threadId) {
+      throw new Error("codex_thread_not_started");
+    }
+
+    await this.request(
+      "thread/goal/clear",
       {
         threadId: this.threadId,
       },
@@ -1149,6 +1254,33 @@ export class OakCodexClient {
       if (status === "idle" && (this.currentTurn || this.resumedTurnActive)) {
         this.finishCurrentTurn(this.activeTurnId, null, false);
       }
+      return;
+    }
+
+    if (method === "thread/goal/updated") {
+      const threadId = this.resolveNotificationThreadId(params);
+      const goal = extractThreadGoal(params.goal);
+      if (!threadId || !goal) {
+        return;
+      }
+      this.options.onEvent({
+        type: "goal_updated",
+        threadId,
+        turnId: asString(params.turnId),
+        goal,
+      });
+      return;
+    }
+
+    if (method === "thread/goal/cleared") {
+      const threadId = this.resolveNotificationThreadId(params);
+      if (!threadId) {
+        return;
+      }
+      this.options.onEvent({
+        type: "goal_cleared",
+        threadId,
+      });
       return;
     }
 

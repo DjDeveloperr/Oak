@@ -96,6 +96,14 @@ Inspect context usage:
 oak-api context <discord-thread-id>
 ```
 
+Get, set, or clear a Codex app-server goal for a loaded Oak session:
+
+```bash
+oak-api goal get <discord-thread-id>
+oak-api goal set <discord-thread-id> "Finish the migration" --token-budget 200000
+oak-api goal clear <discord-thread-id>
+```
+
 Manually compact context:
 
 ```bash
@@ -305,6 +313,27 @@ Returns Oak's last final answer for the session.
 
 Returns the most recent app-server token usage and the percentage of context used when the model context window is known.
 
+`GET /sessions/:discordThreadId/goal`
+
+Reads the current app-server goal for the session.
+
+`POST /sessions/:discordThreadId/goal`
+
+Sets the current app-server goal for the session.
+
+Body:
+
+```json
+{
+  "objective": "Finish the migration",
+  "tokenBudget": 200000
+}
+```
+
+`DELETE /sessions/:discordThreadId/goal`
+
+Clears the current app-server goal for the session.
+
 `POST /sessions/:discordThreadId/compact`
 
 Triggers `thread/compact/start` for that Codex thread.
@@ -373,4 +402,6 @@ Oak uses Codex app-server JSON-RPC over a local WebSocket. Current protocol supp
 - `turn/interrupt`
 - `model/list`
 - `thread/tokenUsage/updated`
+- `thread/goal/set`, `thread/goal/get`, `thread/goal/clear`
+- `thread/goal/updated`, `thread/goal/cleared`
 - `thread/compacted` and `contextCompaction` item notifications

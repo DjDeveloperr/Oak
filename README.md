@@ -94,6 +94,8 @@ Mention commands:
 - `@Oak compact`
 - `@Oak goal`
 - `@Oak goal <objective>`
+- `@Oak goal start`
+- `@Oak goal stop`
 - `@Oak goal clear`
 - `@Oak restart`
 - `@Oak restart bot`

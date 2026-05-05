@@ -319,7 +319,7 @@ Reads the current app-server goal for the session.
 
 `POST /sessions/:discordThreadId/goal`
 
-Sets the current app-server goal for the session.
+Sets the current app-server goal for the session and starts Codex working on it.
 
 Body:
 

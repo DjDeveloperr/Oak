@@ -100,6 +100,8 @@ const OAK_MODEL_OPTIONS_CACHE_TTL_MS = 5 * 60 * 1000;
 const OAK_RECOVERY_MAX_ELAPSED_MS = 5 * 60 * 1000;
 const OAK_ADMIN_WORKSPACE_KEY = "oak-admin";
 const OAK_SUPERAGENT_THREAD_NAME_PREFIX = "Oak Superagent";
+const OAK_THREAD_TITLE_SIDE_NOTE =
+  'Side note: Determine a suitable title for this thread and run command echo "DISCORD: <title>" And oak should parse any command run like that and rename the thread in discord to that';
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const execFileAsync = promisify(execFile);
 
@@ -205,6 +207,12 @@ function getSessionChannelName(channel: OakSessionChannel): string {
   return "name" in channel && typeof channel.name === "string"
     ? channel.name
     : "Oak DM Superagent";
+}
+
+function canRenameSessionChannel(
+  channel: OakSessionChannel,
+): channel is ThreadChannel {
+  return "setName" in channel && typeof channel.setName === "function";
 }
 
 function getSessionChannelGuildId(channel: OakSessionChannel): string | null {
@@ -636,6 +644,58 @@ function extractExecCommandsFromRolloutPayload(
       return [parameters.cmd];
     })
     .filter((command) => normalizeWhitespace(command).length > 0);
+}
+
+function parseDiscordTitleCommand(command: string): string | null {
+  const normalized = command.trim();
+  const match = normalized.match(
+    /\becho\s+(?:"DISCORD:\s*([^"]+)"|'DISCORD:\s*([^']+)'|DISCORD:\s*([^;&|\n]+))/is,
+  );
+  const title = (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim();
+  return title ? title : null;
+}
+
+function normalizeDiscordThreadTitle(title: string): string {
+  return title
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 100);
+}
+
+async function applyDiscordThreadTitleFromCommand(
+  session: SessionContext,
+  command: string,
+): Promise<void> {
+  if (!canRenameSessionChannel(session.thread)) {
+    return;
+  }
+
+  const title = parseDiscordTitleCommand(command);
+  if (!title) {
+    return;
+  }
+
+  const normalizedTitle = normalizeDiscordThreadTitle(title);
+  if (!normalizedTitle || normalizedTitle === getSessionChannelName(session.thread)) {
+    return;
+  }
+
+  try {
+    await session.thread.setName(normalizedTitle, "Oak Codex title command");
+    session.record = {
+      ...session.record,
+      discordThreadName: normalizedTitle,
+      updatedAt: new Date().toISOString(),
+    };
+    await persistSession(session);
+  } catch (error) {
+    console.error("[oak] Failed to rename Discord thread from Codex command:", {
+      discordThreadId: session.thread.id,
+      title: normalizedTitle,
+      error,
+    });
+  }
 }
 
 function splitDiscordText(
@@ -1114,6 +1174,33 @@ function buildSyntheticTextInput(text: string): OakUserInput[] {
       text_elements: [],
     },
   ];
+}
+
+function appendThreadTitleSideNoteToInput(input: OakUserInput[]): OakUserInput[] {
+  let appended = false;
+  return input.map((entry) => {
+    if (appended || entry.type !== "text") {
+      return entry;
+    }
+
+    appended = true;
+    return {
+      ...entry,
+      text: `${entry.text.trimEnd()}\n\n${OAK_THREAD_TITLE_SIDE_NOTE}`,
+    };
+  });
+}
+
+function buildGoalStartInput(goal: OakGoalRecord): OakUserInput[] {
+  return buildSyntheticTextInput(
+    [
+      "Start working on the current thread goal.",
+      "",
+      `Goal: ${goal.objective}`,
+      "",
+      "Continue until the goal is complete, you need user input, or you are interrupted.",
+    ].join("\n"),
+  );
 }
 
 function buildTokenUsageRecord(usage: OakTokenUsage): OakTokenUsageRecord {
@@ -2202,6 +2289,7 @@ async function handleSessionEvent(
           session.streamedOutputKeys.add(eventKey);
         }
       }
+      await applyDiscordThreadTitleFromCommand(session, event.command);
       await sendCompactCommand(session.thread, event.command);
       return;
     case "assistant_message":
@@ -2499,6 +2587,9 @@ async function pollRolloutFile(session: SessionContext): Promise<void> {
     if (entry.type === "response_item") {
       const commands = extractExecCommandsFromRolloutPayload(payload);
       if (commands.length > 0) {
+        for (const command of commands) {
+          await applyDiscordThreadTitleFromCommand(session, command);
+        }
         continue;
       }
     }
@@ -2636,6 +2727,9 @@ async function ensureSessionReady(session: SessionContext): Promise<void> {
     session.ready &&
     session.client.currentThreadId === session.record.codexThreadId
   ) {
+    if (session.record.streamingActive && !session.client.isWorking) {
+      session.client.adoptResumedTurn(session.record.activeTurnId);
+    }
     return;
   }
 
@@ -3061,10 +3155,52 @@ async function startSessionTurn(
   });
 }
 
+async function interruptSessionTurn(
+  session: SessionContext,
+): Promise<string | null> {
+  if (!session.client.isWorking && !sessionHasActiveStreaming(session)) {
+    return null;
+  }
+
+  await ensureSessionReady(session);
+  if (!session.client.isWorking && sessionHasActiveStreaming(session)) {
+    session.client.adoptResumedTurn(session.record.activeTurnId);
+  }
+
+  const interruptedTurnId = await session.client.interruptTurn();
+  session.interruptingTurnId = interruptedTurnId;
+  setTyping(session, false);
+  return interruptedTurnId;
+}
+
+async function startGoalWork(
+  session: SessionContext,
+  goal: OakGoalRecord,
+  lastInteractorUserId: string | null,
+): Promise<"started" | "steered"> {
+  await ensureSessionReady(session);
+  session.record = {
+    ...session.record,
+    lastInteractorUserId,
+    updatedAt: new Date().toISOString(),
+  };
+  await persistSession(session);
+
+  const input = buildGoalStartInput(goal);
+  if (session.client.isWorking) {
+    await session.client.steerTurn(input);
+    return "steered";
+  }
+
+  await startSessionTurn(session, input);
+  return "started";
+}
+
 async function dispatchTextToSession(
   session: SessionContext,
   text: string,
   lastInteractorUserId: string | null,
+  options?: { includeTitleSideNote?: boolean },
 ): Promise<"started" | "steered"> {
   if (
     session.needsClientRefresh &&
@@ -3082,7 +3218,9 @@ async function dispatchTextToSession(
   };
   await persistSession(session);
 
-  const input = buildSyntheticTextInput(text);
+  const input = options?.includeTitleSideNote
+    ? appendThreadTitleSideNoteToInput(buildSyntheticTextInput(text))
+    : buildSyntheticTextInput(text);
   if (session.client.isWorking) {
     await session.client.steerTurn(input);
     return "steered";
@@ -3095,6 +3233,7 @@ async function dispatchTextToSession(
 async function dispatchTurnFromMessage(
   session: SessionContext,
   message: Message,
+  options?: { includeTitleSideNote?: boolean },
 ): Promise<void> {
   if (
     session.needsClientRefresh &&
@@ -3114,7 +3253,10 @@ async function dispatchTurnFromMessage(
   };
   await persistSession(session);
 
-  const input = await buildUserInputs(message);
+  const rawInput = await buildUserInputs(message);
+  const input = options?.includeTitleSideNote
+    ? appendThreadTitleSideNoteToInput(rawInput)
+    : rawInput;
 
   if (session.client.isWorking) {
     await session.client.steerTurn(input);
@@ -4079,6 +4221,48 @@ async function handleGoalCommand(
       return true;
     }
 
+    if (value === "start") {
+      const goal = await session.client.getGoal();
+      await setSessionGoal(session, goal);
+      if (!session.record.goal) {
+        await message.reply("No goal is set for this thread.");
+        return true;
+      }
+
+      const dispatch = await startGoalWork(
+        session,
+        session.record.goal,
+        message.author.id,
+      );
+      await message.reply(
+        dispatch === "steered"
+          ? "Queued the goal on the running turn."
+          : "Started working on this thread's goal.",
+      );
+      return true;
+    }
+
+    if (value === "stop") {
+      try {
+        await interruptSessionTurn(session);
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        if (
+          !errorMessage.includes("codex_turn_id_unavailable") &&
+          !errorMessage.includes("codex_turn_not_running") &&
+          !errorMessage.includes("expected active turn id") &&
+          !errorMessage.includes("active turn id mismatch")
+        ) {
+          throw error;
+        }
+      }
+      await session.client.clearGoal();
+      await setSessionGoal(session, null);
+      await message.reply("Stopped this thread's goal.");
+      return true;
+    }
+
     if (value === "clear") {
       await session.client.clearGoal();
       await setSessionGoal(session, null);
@@ -4090,7 +4274,21 @@ async function handleGoalCommand(
     if (goal) {
       await setSessionGoal(session, goal);
     }
-    await message.reply(formatGoal(session.record.goal));
+    const dispatch = session.record.goal
+      ? await startGoalWork(session, session.record.goal, message.author.id)
+      : null;
+    await message.reply(
+      [
+        formatGoal(session.record.goal),
+        dispatch
+          ? dispatch === "steered"
+            ? "Queued the goal on the running turn."
+            : "Started working on this thread's goal."
+          : null,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
   } catch (error) {
     await message.reply(error instanceof Error ? error.message : String(error));
   }
@@ -4318,10 +4516,7 @@ async function handleInterruptCommand(
 
   if (session.client.isWorking || sessionHasActiveStreaming(session)) {
     try {
-      await ensureSessionReady(session);
-      const interruptedTurnId = await session.client.interruptTurn();
-      session.interruptingTurnId = interruptedTurnId;
-      setTyping(session, false);
+      await interruptSessionTurn(session);
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -5274,12 +5469,7 @@ async function handleMessage(
     log("Received owner DM", { userId: message.author.id });
     const session = await getOrCreateAdminDmSuperagentSession(message.client);
     if (isInterruptCommandText(message.content)) {
-      if (session.client.isWorking || sessionHasActiveStreaming(session)) {
-        await ensureSessionReady(session);
-        const interruptedTurnId = await session.client.interruptTurn();
-        session.interruptingTurnId = interruptedTurnId;
-        setTyping(session, false);
-      }
+      await interruptSessionTurn(session);
       await message.reply("Interrupted.");
       return;
     }
@@ -5364,7 +5554,9 @@ async function handleMessage(
 
     const thread = await startThreadForTextMessage(message, botUserId);
     const session = await createFreshSession(thread);
-    await dispatchTurnFromMessage(session, message);
+    await dispatchTurnFromMessage(session, message, {
+      includeTitleSideNote: true,
+    });
     return;
   }
 
@@ -5383,7 +5575,9 @@ async function handleMessage(
   }
 
   const session = await createFreshSession(message.channel);
-  await dispatchTurnFromMessage(session, message);
+  await dispatchTurnFromMessage(session, message, {
+    includeTitleSideNote: true,
+  });
 }
 
 async function handleRawDmMessage(
@@ -5423,12 +5617,7 @@ async function handleRawDmMessage(
 
   const session = await getOrCreateAdminDmSuperagentSession(discordClient);
   if (isInterruptCommandText(data.content ?? "")) {
-    if (session.client.isWorking || sessionHasActiveStreaming(session)) {
-      await ensureSessionReady(session);
-      const interruptedTurnId = await session.client.interruptTurn();
-      session.interruptingTurnId = interruptedTurnId;
-      setTyping(session, false);
-    }
+    await interruptSessionTurn(session);
     await channel.send("Interrupted.");
     return;
   }
@@ -5692,7 +5881,9 @@ async function createApiThread(
   }
   const prompt = optionalStringField(body, "prompt");
   if (prompt) {
-    await dispatchTextToSession(session, prompt, null);
+    await dispatchTextToSession(session, prompt, null, {
+      includeTitleSideNote: true,
+    });
   } else {
     await ensureSessionReady(session);
   }
@@ -5919,9 +6110,13 @@ async function handleOakApiRequest(
         if (goal) {
           await setSessionGoal(session, goal);
         }
+        const dispatch = session.record.goal
+          ? await startGoalWork(session, session.record.goal, null)
+          : null;
         writeJsonResponse(response, 200, {
           text: formatGoal(session.record.goal),
           goal: session.record.goal,
+          dispatch,
         });
         return;
       }
@@ -5955,10 +6150,7 @@ async function handleOakApiRequest(
       return;
     }
     if (method === "POST" && parts[2] === "interrupt") {
-      await ensureSessionReady(session);
-      const turnId = await session.client.interruptTurn();
-      session.interruptingTurnId = turnId;
-      setTyping(session, false);
+      const turnId = await interruptSessionTurn(session);
       writeJsonResponse(response, 200, { turnId });
       return;
     }

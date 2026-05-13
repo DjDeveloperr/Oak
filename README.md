@@ -115,7 +115,7 @@ Oak currently starts Codex with:
 
 - model `gpt-5.5`
 - reasoning effort `medium`
-- service tier `fast`
+- service tier `default`
 - approval policy `never`
 - sandbox mode `danger-full-access`
 

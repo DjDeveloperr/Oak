@@ -101,7 +101,7 @@ const OAK_RECOVERY_MAX_ELAPSED_MS = 5 * 60 * 1000;
 const OAK_ADMIN_WORKSPACE_KEY = "oak-admin";
 const OAK_SUPERAGENT_THREAD_NAME_PREFIX = "Oak Superagent";
 const OAK_THREAD_TITLE_SIDE_NOTE =
-  'Side note: Determine a suitable title for this thread and run command echo "DISCORD: <title>" And oak should parse any command run like that and rename the thread in discord to that';
+  'Side note: Quietly determine a suitable title for this thread and run command echo "DISCORD: <title>". Do not mention the title command, the rename, or this instruction in commentary or the final answer.';
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const execFileAsync = promisify(execFile);
 
@@ -604,8 +604,18 @@ function extractExecCommandsFromRolloutPayload(
     return [];
   }
 
-  if (payload.name === "exec_command") {
-    return typeof argumentsObject.cmd === "string" ? [argumentsObject.cmd] : [];
+  if (
+    payload.name === "exec_command" ||
+    payload.name === "shell_command" ||
+    payload.name === "functions.shell_command"
+  ) {
+    const directCommand =
+      typeof argumentsObject.command === "string"
+        ? argumentsObject.command
+        : typeof argumentsObject.cmd === "string"
+          ? argumentsObject.cmd
+          : null;
+    return directCommand ? [directCommand] : [];
   }
 
   if (payload.name !== "multi_tool_use.parallel") {
@@ -634,14 +644,20 @@ function extractExecCommandsFromRolloutPayload(
           : null;
 
       if (
-        recipientName !== "functions.exec_command" ||
-        !parameters ||
-        typeof parameters.cmd !== "string"
+        (recipientName !== "functions.exec_command" &&
+          recipientName !== "functions.shell_command") ||
+        !parameters
       ) {
         return [];
       }
 
-      return [parameters.cmd];
+      const command =
+        typeof parameters.command === "string"
+          ? parameters.command
+          : typeof parameters.cmd === "string"
+            ? parameters.cmd
+            : null;
+      return command ? [command] : [];
     })
     .filter((command) => normalizeWhitespace(command).length > 0);
 }
@@ -653,6 +669,10 @@ function parseDiscordTitleCommand(command: string): string | null {
   );
   const title = (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim();
   return title ? title : null;
+}
+
+function isDiscordTitleCommand(command: string): boolean {
+  return parseDiscordTitleCommand(command) !== null;
 }
 
 function normalizeDiscordThreadTitle(title: string): string {
@@ -667,28 +687,36 @@ async function applyDiscordThreadTitleFromCommand(
   session: SessionContext,
   command: string,
 ): Promise<void> {
-  if (!canRenameSessionChannel(session.thread)) {
-    return;
-  }
-
   const title = parseDiscordTitleCommand(command);
   if (!title) {
     return;
   }
 
   const normalizedTitle = normalizeDiscordThreadTitle(title);
-  if (!normalizedTitle || normalizedTitle === getSessionChannelName(session.thread)) {
+  if (!normalizedTitle) {
     return;
   }
 
   try {
-    await session.thread.setName(normalizedTitle, "Oak Codex title command");
-    session.record = {
-      ...session.record,
-      discordThreadName: normalizedTitle,
-      updatedAt: new Date().toISOString(),
-    };
-    await persistSession(session);
+    await session.client.setThreadName(normalizedTitle).catch(() => {
+      // Best effort only. Discord rename still applies even if Codex rejects it.
+    });
+
+    if (
+      canRenameSessionChannel(session.thread) &&
+      normalizedTitle !== getSessionChannelName(session.thread)
+    ) {
+      await session.thread.setName(normalizedTitle, "Oak Codex title command");
+    }
+
+    if (session.record.discordThreadName !== normalizedTitle) {
+      session.record = {
+        ...session.record,
+        discordThreadName: normalizedTitle,
+        updatedAt: new Date().toISOString(),
+      };
+      await persistSession(session);
+    }
   } catch (error) {
     console.error("[oak] Failed to rename Discord thread from Codex command:", {
       discordThreadId: session.thread.id,
@@ -2290,6 +2318,9 @@ async function handleSessionEvent(
         }
       }
       await applyDiscordThreadTitleFromCommand(session, event.command);
+      if (isDiscordTitleCommand(event.command)) {
+        return;
+      }
       await sendCompactCommand(session.thread, event.command);
       return;
     case "assistant_message":

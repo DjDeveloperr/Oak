@@ -690,6 +690,23 @@ export class OakCodexClient {
     }
   }
 
+  async setThreadName(name: string): Promise<void> {
+    await this.ensureConnected();
+
+    if (!this.threadId) {
+      throw new Error("codex_thread_not_started");
+    }
+
+    await this.request(
+      "thread/name/set",
+      {
+        threadId: this.threadId,
+        name,
+      },
+      10000,
+    );
+  }
+
   async archiveThread(threadId?: string | null): Promise<void> {
     await this.ensureConnected();
     const targetThreadId = threadId ?? this.threadId;

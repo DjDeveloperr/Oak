@@ -6,6 +6,7 @@ import type { OakAccessConfigSnapshot } from "./accessConfig.js";
 import {
   DEFAULT_OAK_MODEL,
   DEFAULT_OAK_REASONING_EFFORT,
+  normalizeOakServiceTier,
 } from "./threadPreferences.js";
 
 function findUp(startDir: string, marker: string): string | null {
@@ -136,7 +137,9 @@ export const oakConfig = {
     DEFAULT_OAK_REASONING_EFFORT,
   reasoningSummary:
     (process.env.OAK_CODEX_REASONING_SUMMARY ?? "concise").trim() || null,
-  serviceTier: (process.env.OAK_CODEX_SERVICE_TIER ?? "").trim() || "fast",
+  serviceTier: normalizeOakServiceTier(
+    (process.env.OAK_CODEX_SERVICE_TIER ?? "").trim() || null,
+  ),
   turnTimeoutMs: parseInteger(process.env.OAK_TURN_TIMEOUT_MS, 60 * 60 * 1000),
   typingIntervalMs: parseInteger(process.env.OAK_TYPING_INTERVAL_MS, 8000),
   apiHost: (process.env.OAK_API_HOST ?? "127.0.0.1").trim(),
